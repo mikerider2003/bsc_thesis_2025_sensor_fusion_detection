@@ -25,13 +25,7 @@ Due to the size of the original dataset (1TB), this study will use a subset of t
 To download the dataset, you can use the following command:
 
 ```bash
-cd "scripts/Data fetcher"
-python generate_s5cmd_batch.py # This will generate download_5percent.s5cmd file with 80/20 split
-```
-Move the generated `download_5percent.s5cmd` to desired directory and run the following command to download the dataset:
-
-```bash
-s5cmd --no-sign-request run download_5percent.s5cmd
+./scripts/download_dataset.sh
 ```
 
 
@@ -44,8 +38,11 @@ s5cmd --no-sign-request run download_5percent.s5cmd
 │   │   │   ├── calibration
 │   │   │   ├── sensors
 │   │   │   │   ├── lidar
+│   │   │   │   │   ├── 315968251560183000.feather
 │   │   │   │   ├── cameras
 │   │   │   │   │   ├── ring_front_center
+│   │   │   │   │   │   ├── 315968251549927220.jpg
+│   │   │   │   │   │   ├── ...
 │   │   │   │   │   ├── ring_front_left
 │   │   │   │   │   ├── ring_front_right
 │   │   │   │   │   ├── ring_rear_left
