@@ -167,8 +167,11 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     load_dotenv()
-    dataset_path = os.getenv('DATA_PATH', default='/src/data')
+    dataset_path = os.getenv('DATA_PATH', default='src/data/')
 
+    # Check if the dataset path exists
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
     # Create dataset and loader
     train_dataset = ArgoDataset(dataset_path, split='train')
