@@ -1,5 +1,5 @@
 import os
-import loader
+import src.loaders.loader as loader
 import numpy as np
 import pandas as pd
 import pyarrow.feather as feather
@@ -9,18 +9,6 @@ from tqdm import tqdm
 class PointPillarsLoader(loader.ArgoDataset):
     def __init__(self, dataset_path, split='train', cameras=None, lidar=True):
         super().__init__(dataset_path, split, cameras, lidar)
-
-    def __getitem__(self, index):
-        # Load the sample
-        sample = self.samples[index]
-
-        data = {}
-        # Load and process lidarLiDAR data
-        # TODO: REMOVE debug=True
-        data['lidar'] = self._process_lidar(sample['lidar_file'], debug=True)
-        
-
-        return data
 
     def _process_lidar(self, lidar_file, 
                        max_pillars=12000, 
@@ -161,17 +149,19 @@ class PointPillarsLoader(loader.ArgoDataset):
         # Determine how many samples to process
         num_samples = min(len(self), limit) if limit is not None else len(self)
         
-        for sample in tqdm(range(num_samples), desc="Processing samples", ncols=100):
-            data = self.__getitem__(sample)
-            self.processed_samples.append(data)
-        
-        return self.processed_samples
+        for i in tqdm(range(num_samples), desc="Processing samples", ncols=100):
+            sample = self.samples[i]
+            lidar_file = sample['lidar_file']
 
-        
-        
+            # processed_sample = self._process_lidar(lidar_file=lidar_file)
+            # TODO: REMOVE debug=True
+            processed_sample = self._process_lidar(lidar_file=lidar_file, debug=True)
+            print(f"Processed sample {processed_sample[0].shape}, {processed_sample[1].shape}")
 
-        
-        
+            sample["lidar_processed"] = processed_sample
+            self.processed_samples.append(sample)
+            
+        return self.processed_samples    
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
@@ -186,8 +176,7 @@ if __name__ == "__main__":
     # Create dataset and loader
     train_dataset = PointPillarsLoader(dataset_path, split='train')
     processed_samples = train_dataset.process_all_samples(limit=1)
-    print(processed_samples[0]["lidar"][0].shape)
-    print(processed_samples[0]["lidar"][1].shape)
+    # print(train_dataset[0]["lidar_processed"])
 
     # Sample format:
     # {
@@ -196,4 +185,5 @@ if __name__ == "__main__":
     #     'lidar_file': os.path.join(lidar_dir, f"{timestamp}.feather"),
     #     'camera_frames': camera_frames,
     #     'annotations': frame_annotations
+    #     'lidar_processed': (pillars, coords)
     # }
