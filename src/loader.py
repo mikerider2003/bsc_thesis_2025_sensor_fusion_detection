@@ -87,9 +87,6 @@ class ArgoDataset(Dataset):
                             'camera_frames': camera_frames,
                             'annotations': frame_annotations
                         })
-            #             # TODO: REMOVE THIS    
-            #             break
-            # break
         return samples
         
     def __len__(self):
@@ -149,17 +146,18 @@ class ArgoDataset(Dataset):
 
         return camera_images
     
-    def process_all_samples(self):
+    def process_all_samples(self, limit=None):
         """Process all samples in the dataset."""
         self.processed_samples = []
 
-        for sample in tqdm(range(len(self)), desc="Processing all samples", ncols=100):
+        # Determine how many samples to process
+        num_samples = min(len(self), limit) if limit is not None else len(self)
+        
+        for sample in tqdm(range(num_samples), desc="Processing samples", ncols=100):
             data = self.__getitem__(sample)
             self.processed_samples.append(data)
         
         return self.processed_samples
-
-        
 
 
 # Example DataLoader usage
@@ -175,7 +173,7 @@ if __name__ == "__main__":
     
     # Create dataset and loader
     train_dataset = ArgoDataset(dataset_path, split='train')
-    processed_samples = train_dataset.process_all_samples()
+    processed_samples = train_dataset.process_all_samples(limit=10)
 
     print(f"Processed {len(processed_samples)} samples.")
 
