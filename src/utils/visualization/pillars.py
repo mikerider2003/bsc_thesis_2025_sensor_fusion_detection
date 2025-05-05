@@ -36,7 +36,8 @@ def visualize_pillars_2d(pillars, coords, annotations=None, voxel_size=(0.3, 0.3
     
     # Plot each pillar as a rectangle
     for p in range(num_pillars):
-        x_idx, y_idx = coords[p, 0], coords[p, 1]
+        # Get x_idx and y_idx from correct positions (1 and 2) since batch_index is at position 0
+        x_idx, y_idx = coords[p, 1], coords[p, 2]
         
         # Skip if coordinates are all zeros (empty pillar)
         if x_idx == 0 and y_idx == 0 and np.sum(pillars[p]) == 0:
@@ -151,7 +152,7 @@ def main():
     
     # Process a sample
     sample = train_dataset.samples[0]
-    pillars, coords = train_dataset._process_lidar(sample['lidar_file'], debug=False)
+    pillars, coords = train_dataset._process_lidar(sample['lidar_file'], batch_index=sample["batch_index"], debug=False)
     
     annotations = sample.get('annotations', None)
     print(f"Annotations columns: {annotations.columns}")

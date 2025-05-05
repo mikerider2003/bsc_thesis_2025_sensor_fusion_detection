@@ -55,6 +55,7 @@ class ArgoDataset(Dataset):
     def _load_samples_from_sequences(self):
         """Load all samples from the dataset sequences."""
         samples = []
+        batch_index = -1
         for seq_path in tqdm(self.sequences, desc="Loading sequences", ncols=100):
             # Load annotations
             anno_path = os.path.join(seq_path, 'annotations.feather')
@@ -68,6 +69,7 @@ class ArgoDataset(Dataset):
                     
                     for lidar_file in lidar_files:
                         timestamp = int(lidar_file.split('.')[0])
+                        batch_index += 1
                         
                         # Check if corresponding camera images exist
                         camera_frames = {}
@@ -86,6 +88,7 @@ class ArgoDataset(Dataset):
                         samples.append({
                             'sequence_path': seq_path,
                             'timestamp': timestamp,
+                            'batch_index': batch_index,
                             'lidar_file': os.path.join(lidar_dir, f"{timestamp}.feather"),
                             'camera_frames': camera_frames,
                             'annotations': frame_annotations

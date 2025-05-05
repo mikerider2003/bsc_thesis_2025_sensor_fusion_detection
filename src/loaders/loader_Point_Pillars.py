@@ -11,6 +11,7 @@ class PointPillarsLoader(loader.ArgoDataset):
         super().__init__(dataset_path, split, cameras, lidar)
 
     def _process_lidar(self, lidar_file, 
+                       batch_index=None, 
                        max_pillars=12000, 
                        max_points=100, 
                        voxel_size=(0.3, 0.3), 
@@ -114,7 +115,7 @@ class PointPillarsLoader(loader.ArgoDataset):
                 if pt_idx < max_points:
                     # For the first point in each pillar, store the coordinates
                     if pt_idx == 0:
-                        coords[p] = [ix[i], iy[i], 0]
+                        coords[p] = [batch_index, ix[i], iy[i]]
                     
                     # Efficiently collect points for later processing
                     pillars[p, pt_idx, 0:4] = [x, y, z, intensity]
@@ -127,7 +128,7 @@ class PointPillarsLoader(loader.ArgoDataset):
                 continue
                 
             # Compute pillar center
-            x_idx, y_idx = coords[p, 0], coords[p, 1]
+            x_idx, y_idx = coords[p, 1], coords[p, 2]
             cx = x_range[0] + (x_idx + 0.5) * voxel_size[0]
             cy = y_range[0] + (y_idx + 0.5) * voxel_size[1]
             
@@ -152,10 +153,11 @@ class PointPillarsLoader(loader.ArgoDataset):
         for i in tqdm(range(num_samples), desc="Processing samples", ncols=100):
             sample = self.samples[i]
             lidar_file = sample['lidar_file']
+            batch_index = sample['batch_index']
 
             # processed_sample = self._process_lidar(lidar_file=lidar_file)
             # TODO: REMOVE debug=True
-            processed_sample = self._process_lidar(lidar_file=lidar_file, debug=True)
+            processed_sample = self._process_lidar(lidar_file=lidar_file, batch_index=batch_index)
             print(f"Processed sample {processed_sample[0].shape}, {processed_sample[1].shape}")
 
             sample["lidar_processed"] = processed_sample
@@ -175,8 +177,13 @@ if __name__ == "__main__":
     
     # Create dataset and loader
     train_dataset = PointPillarsLoader(dataset_path, split='train')
-    processed_samples = train_dataset.process_all_samples(limit=1)
-    # print(train_dataset[0]["lidar_processed"])
+    
+    # TODO: REMOVE limit
+    processed_samples = train_dataset.process_all_samples(limit=5)
+
+    for processed_sample in processed_samples:
+        pillars, coords = processed_sample["lidar_processed"]
+        print(coords)
 
     # Sample format:
     # {
