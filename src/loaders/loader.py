@@ -32,10 +32,11 @@ class ArgoDataset(Dataset):
     
         # Find all sequences
         self.sequences = self._get_sequence()
-        print(f"Found {len(self.sequences)} sequences in {self.split} split.")
+        print(f"Found {len(self.sequences)} sequences in {os.path.join(self.root_dir, self.split)} split.")
 
         # Load all samples from sequences
         self.samples = self._load_samples_from_sequences()
+        print(f"Loaded {len(self.samples)} samples from sequences.")
 
     def _get_sequence(self):
         sequences = []
@@ -47,6 +48,8 @@ class ArgoDataset(Dataset):
                 if os.path.isdir(os.path.join(split_dir, d))
             ])
             sequences = [os.path.join(split_dir, d) for d in sequence_folders]
+        # TODO: REMOVE THIS
+        return list(sequences[0:1])
         return sequences
     
     def _load_samples_from_sequences(self):
@@ -94,70 +97,8 @@ class ArgoDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        data = {}
 
-        # Save the sequence path and timestamp
-        data['sequence_path'] = sample['sequence_path']
-        data['timestamp'] = sample['timestamp']
-
-        # Load the lidar data
-        data['lidar'] = self.process_lidar(lidar_file=sample['lidar_file'])
-
-        # Load the corresponding camera images
-        data['cameras'] = self.process_cameras(camera_frames=sample['camera_frames'], sequence_path=sample['sequence_path'])
-
-        # Load the annotations
-        data["annotations"] = sample['annotations']
-
-        return data
-
-    def process_lidar(self, lidar_file):
-        """Load LiDAR data from a feather file."""
-        # Read the LiDAR data file
-        lidar_data = feather.read_feather(lidar_file)
-
-        # Convert to numpy array
-        points_np = lidar_data[['x', 'y', 'z', 'intensity']].to_numpy().astype(np.float32)
-
-        # Convert to torch tensor
-        points_torch = torch.from_numpy(points_np)
-        return points_torch
-    
-    def process_cameras(self, camera_frames, sequence_path):
-        """Load camera images."""
-        camera_images = {}
-        for camera, frame in camera_frames.items():
-            camera_dir = os.path.join(sequence_path, 'sensors', 'cameras', camera)
-            image_path = os.path.join(camera_dir, f"{frame}.jpg")
-        
-            if os.path.exists(image_path):
-                # Load the image
-                image = Image.open(image_path).convert('RGB')
-                # Convert to numpy array
-                image_np = np.array(image)
-                # Convert to torch tensor
-                image_torch = torch.from_numpy(image_np).permute(2, 0, 1)
-            
-                camera_images[camera] = image_torch
-                # print(f"Camera {camera} image shape: {image_torch.shape}")
-    
-            else:
-                raise FileNotFoundError(f"Image file {image_path} not found.")
-
-        return camera_images
-    
-    def process_all_samples(self, limit=None):
-        """Process all samples in the dataset."""
-        self.processed_samples = []
-
-        # Determine how many samples to process
-        num_samples = min(len(self), limit) if limit is not None else len(self)
-        
-        for sample in tqdm(range(num_samples), desc="Processing samples", ncols=100):
-            data = self.__getitem__(sample)
-            self.processed_samples.append(data)
-        
-        return self.processed_samples
+        return sample
 
 
 # Example DataLoader usage
@@ -173,16 +114,7 @@ if __name__ == "__main__":
     
     # Create dataset and loader
     train_dataset = ArgoDataset(dataset_path, split='train')
-    processed_samples = train_dataset.process_all_samples(limit=10)
 
-    print(f"Processed {len(processed_samples)} samples.")
-
-    # for i in train_dataset.samples[0]:
-    #     if i == "camera_frames":
-    #         for cam in train_dataset.samples[0][i]:
-    #             print(f"Camera {cam}: {train_dataset.samples[0][i][cam]}")
-    #         continue
-    #     print(f"{i}: {train_dataset.samples[0][i]}")
 
 
             
