@@ -38,6 +38,22 @@ class ArgoDataset(Dataset):
         self.samples = self._load_samples_from_sequences()
         print(f"Loaded {len(self.samples)} samples from sequences.")
 
+        self.classes = self._get_class_categories()
+        print(f"Found {len(self.classes)} unique classes in the dataset.")
+
+    def _get_class_categories(self):
+        classes = set()
+
+        # Loop over all samples and get unique classes
+        for sample in self.samples:
+            annotations = sample['annotations']
+
+            # Extract unique classes from category column
+            unique_classes = annotations['category'].unique()
+            classes.update(unique_classes)
+        
+        return classes
+
     def _get_sequence(self):
         sequences = []
         split_dir = os.path.join(self.root_dir, self.split)

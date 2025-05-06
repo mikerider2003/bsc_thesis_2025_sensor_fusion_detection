@@ -76,6 +76,70 @@ class PseudoImageScatter(nn.Module):
         
         return pseudo_image
 
+class CNN_BackBone(nn.Module):
+    def __init__(self, in_channels=64):
+        super(CNN_BackBone, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        return x
+
+# SSD Detection Head for predicting bounding boxes
+class SSDDetectionHead(nn.Module):
+    def __init__(self, num_classes, in_channels=128):
+        super(SSDDetectionHead, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(256)
+
+        # For each class, predict 7 values: (x, y, z, length, width, height, θ)
+        self.conv2 = nn.Conv2d(256, num_classes * 7, kernel_size=3, padding=1)
+        
+        # Class prediction
+        self.conv3 = nn.Conv2d(256, num_classes, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        bbox_regression = self.conv2(x)
+        class_scores = self.conv3(x)
+        return bbox_regression, class_scores
+
+class PointPillarsModel(nn.Module):
+    def __init__(self, num_classes, voxel_size=(0.3, 0.3), x_range=(-100, 100), y_range=(-100, 100)):
+        super(PointPillarsModel, self).__init__()
+        
+        # Calculate grid dimensions
+        self.nx = int(np.floor((x_range[1] - x_range[0]) / voxel_size[0]))
+        self.ny = int(np.floor((y_range[1] - y_range[0]) / voxel_size[1]))
+        
+        # Model components
+        self.pfn = PillarFeatureNet(in_channels=9, out_channels=64)
+        self.scatter = PseudoImageScatter(output_shape=(self.ny, self.nx), num_features=64)
+        self.backbone = CNN_BackBone(in_channels=64)
+        self.head = SSDDetectionHead(num_classes=num_classes, in_channels=128)
+        
+    def forward(self, pillars, coords):
+        # Pillar feature encoding
+        pillar_features = self.pfn(pillars)  # [P, C]
+        
+        # Scatter to pseudo image
+        pseudo_image = self.scatter(pillar_features, coords)  # [1, C, H, W]
+        
+        # CNN backbone
+        cnn_features = self.backbone(pseudo_image)  # [1, 128, H/4, W/4]
+        
+        # SSD head
+        bbox_preds, cls_scores = self.head(cnn_features)
+        
+        return bbox_preds, cls_scores
+
 # For testing/debugging
 if __name__ == "__main__":
     from dotenv import load_dotenv
@@ -101,34 +165,14 @@ if __name__ == "__main__":
 
     print(f"Input pillar shape: {pillars.shape}")
     print(f"Coords shape: {coords.shape}")
-    
-    # Calculate grid dimensions based on x_range and y_range from loader
-    x_range = (-100, 100)
-    y_range = (-100, 100)
-    voxel_size = (0.3, 0.3)
-    
-    nx = int(np.floor((x_range[1] - x_range[0]) / voxel_size[0]))
-    ny = int(np.floor((y_range[1] - y_range[0]) / voxel_size[1]))
-    
-    
-    # Create model
-    pfn = PillarFeatureNet()
-    scatter = PseudoImageScatter(output_shape=(ny, nx), num_features=64)
-    
-    # Forward pass
-    pillar_features = pfn(pillars_tensor)
-    pseudo_image = scatter(pillar_features, coords_tensor)
 
-    print(f"Pillar features shape: {pillar_features.shape}")
-    print(f"Pseudo-image shape: {pseudo_image.shape}")
-    
-    # Check if any features were scattered
-    non_zero = torch.count_nonzero(pseudo_image)
-    print(f"Number of non-zero elements in pseudo-image: {non_zero}")
-    
-    # Visualize a slice of the pseudo-image if desired
-    if pseudo_image.shape[0] > 0:
-        # Take first batch, first channel
-        sample_slice = pseudo_image[0, 0].detach().cpu().numpy()
-        print(f"Sum of values in first channel slice: {np.sum(sample_slice)}")
-        print(f"Max value in first channel slice: {np.max(sample_slice)}")
+    # Initialize the model
+    model = PointPillarsModel(num_classes=len(train_dataset.classes) + 1)  # +1 for background class
+
+    # Forward pass
+    bbox_preds, cls_scores = model(pillars_tensor, coords_tensor)
+    print(f"Bounding box predictions shape: {bbox_preds.shape}")
+    print(f"Class scores shape: {cls_scores.shape}")
+
+
+
