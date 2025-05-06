@@ -126,6 +126,11 @@ The features for each point include:
 - `/src/models/PointPillars.py`: Will contain the model architecture implementation (currently empty, to be implemented)
 - `/scripts/run_train_pointpillars.sh`: Will be used for training the PointPillars model (currently empty, to be implemented)
 
+##### Usage:
+```bash
+python -m src.loaders.loader_Point_Pillars
+python -m src.utils.visualization.pillars
+```
 
 ### Multi-Modal
 #### PointFusion (Early Fusion)

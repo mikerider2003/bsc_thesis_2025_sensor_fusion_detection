@@ -183,7 +183,21 @@ if __name__ == "__main__":
 
     for processed_sample in processed_samples:
         pillars, coords = processed_sample["lidar_processed"]
-        print(coords)
+
+        # count how many pillars are in each batch
+        non_empty_mask = ~((coords[:, 1] == 0) & (coords[:, 2] == 0))
+        non_empty_count = np.sum(non_empty_mask)
+        
+        # Ratio of pillars used to total pillars
+        ratio = non_empty_count / coords.shape[0]
+
+        # Count how many points on average per pillar
+        points_per_pillar = np.sum(pillars != 0, axis=1)
+        avg_points = np.mean(points_per_pillar[non_empty_mask])
+
+        print(f"Batch {processed_sample['batch_index']}: {non_empty_count} non-empty pillars, ratio: {ratio:.2f}, avg num of points per pillar: {avg_points:.2f}")
+
+
 
     # Sample format:
     # {
