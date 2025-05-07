@@ -8,13 +8,16 @@ def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8)):
     Visualizes the feature presence in a pseudo-image.
     
     Args:
-        pseudo_image (torch.Tensor): Tensor of shape [1, C, H, W] where C is number of channels
+        pseudo_image (torch.Tensor): Tensor of shape [B, C, H, W] where B is batch size and C is number of channels
         save_path (str, optional): Path to save the visualization. If None, the plot is shown.
         figsize (tuple): Figure size (width, height) in inches
     """
     if isinstance(pseudo_image, torch.Tensor):
         # Move to CPU if on GPU and convert to numpy
         pseudo_image = pseudo_image.detach().cpu().numpy()
+    
+    # Average across the batch dimension
+    pseudo_image = np.mean(pseudo_image, axis=0, keepdims=True)
     
     # Count non-zero elements in each spatial cell
     non_zero_mask = (pseudo_image[0] != 0).sum(axis=0) > 0
@@ -25,7 +28,7 @@ def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8)):
     # Plot binary presence of features with enhanced visibility
     im = plt.imshow(non_zero_mask, cmap='viridis', interpolation='nearest')
     
-    plt.title('Pseudo-Image ', fontsize=16)
+    plt.title('Pseudo-Image Feature Presence', fontsize=16)
     plt.grid(False)
     
     # Higher DPI for better quality
@@ -68,6 +71,10 @@ if __name__ == "__main__":
     # Convert numpy arrays to torch tensors
     pillars_tensor = torch.from_numpy(pillars).float()
     coords_tensor = torch.from_numpy(coords).int()
+    
+    # Add batch dimension
+    pillars_tensor = pillars_tensor.unsqueeze(0)  # [1, P, N, 9]
+    coords_tensor = coords_tensor.unsqueeze(0)    # [1, P, 4]
     
     # Calculate grid dimensions
     x_range = (-100, 100)

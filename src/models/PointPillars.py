@@ -12,14 +12,14 @@ class PillarFeatureNet(nn.Module):
         self.linear = nn.Linear(in_channels, out_channels)
         self.bn = nn.BatchNorm1d(out_channels)
 
-    def forward(self, x):  # x: [P, N, 9]
-        P, N, D = x.shape
-        x = x.view(P * N, D)
+    def forward(self, x):  # x: [B, P, N, 9]
+        B, P, N, D = x.shape
+        x = x.view(B * P * N, D)
         x = self.linear(x)
         x = self.bn(x)
         x = F.relu(x)
-        x = x.view(P, N, -1)
-        x = torch.max(x, dim=1)[0]  # [P, C]
+        x = x.view(B, P, N, -1)
+        x = torch.max(x, dim=2)[0]  # [B, P, C]
         return x
 
 class PseudoImageScatter(nn.Module):
@@ -38,42 +38,46 @@ class PseudoImageScatter(nn.Module):
     def forward(self, pillar_features, coords):
         """
         Args:
-            pillar_features: Tensor of shape [num_pillars, num_features]
-            coords: Tensor of shape [num_pillars, 3] with indices (batch_idx, x_idx, y_idx)
+            pillar_features: Tensor of shape [B, num_pillars, num_features]
+            coords: Tensor of shape [B, num_pillars, 4] with indices (batch_idx, x_idx, y_idx)
         
         Returns:
-            pseudo_image: Tensor of shape [1, num_features, H, W]
+            pseudo_image: Tensor of shape [B, num_features, H, W]
         """
         H, W = self.output_shape
-        
-        # Create empty pseudo-image tensor with batch_size=1
+        B = pillar_features.shape[0]
+
+        # Create empty pseudo-image tensor
         pseudo_image = torch.zeros(
-            (1, self.num_features, H, W),
+            (B, self.num_features, H, W),
             dtype=pillar_features.dtype,
             device=pillar_features.device
         )
-        
-        # Only use non-empty pillars
-        if pillar_features.shape[0] > 0:
-            # Get indices from coords - assuming batch index is always 0
-            x_idx = coords[:, 2].long()  # Note: In your implementation, y is at index 2
-            y_idx = coords[:, 1].long()  # and x is at index 1 (this follows the paper's convention)
-            
-            # Filter out invalid coordinates
-            valid_mask = (
-                (x_idx >= 0) & (x_idx < W) & 
-                (y_idx >= 0) & (y_idx < H)
-            )
-            
-            if valid_mask.any():
-                y_idx_valid = y_idx[valid_mask]
-                x_idx_valid = x_idx[valid_mask]
-                features_valid = pillar_features[valid_mask]
-                
-                # Simple approach - loop through each valid pillar
-                for i in range(len(y_idx_valid)):
-                    pseudo_image[0, :, y_idx_valid[i], x_idx_valid[i]] = features_valid[i]
-        
+
+        # Get indices from coords
+        batch_indices = coords[:, :, 0].long()  # [B, num_pillars]
+        y_indices = coords[:, :, 1].long()      # [B, num_pillars]
+        x_indices = coords[:, :, 2].long()      # [B, num_pillars]
+
+        # Scatter pillar features to the pseudo-image
+        for b in range(B):
+            pillar_features_sample = pillar_features[b]  # [num_pillars, num_features]
+            batch_indices_sample = batch_indices[b]      # [num_pillars]
+            y_indices_sample = y_indices[b]              # [num_pillars]
+            x_indices_sample = x_indices[b]              # [num_pillars]
+
+            # Create a mask to filter out padding
+            mask = (x_indices_sample >= 0) & (x_indices_sample < W) & \
+                   (y_indices_sample >= 0) & (y_indices_sample < H)
+
+            # Apply the mask
+            pillar_features_valid = pillar_features_sample[mask]
+            y_indices_valid = y_indices_sample[mask]
+            x_indices_valid = x_indices_sample[mask]
+
+            # Scatter the valid features
+            pseudo_image[b, :, y_indices_valid, x_indices_valid] = pillar_features_valid.T
+
         return pseudo_image
 
 class CNN_BackBone(nn.Module):
@@ -194,13 +198,13 @@ class PointPillarsModel(nn.Module):
         
     def forward(self, pillars, coords):
         # Pillar feature encoding
-        pillar_features = self.pfn(pillars)  # [P, C]
+        pillar_features = self.pfn(pillars)  # [B, P, C]
         
         # Scatter to pseudo image
-        pseudo_image = self.scatter(pillar_features, coords)  # [1, C, H, W]
+        pseudo_image = self.scatter(pillar_features, coords)  # [B, C, H, W]
         
         # CNN backbone
-        cnn_features = self.backbone(pseudo_image)  # [1, 128, H/4, W/4]
+        cnn_features = self.backbone(pseudo_image)  # [B, 128, H/4, W/4]
         
         # SSD head
         bbox_preds, cls_scores, dir_scores = self.head(cnn_features)
@@ -230,8 +234,12 @@ if __name__ == "__main__":
     pillars_tensor = torch.from_numpy(pillars).float()
     coords_tensor = torch.from_numpy(coords).int()
 
-    print(f"Input pillar shape: {pillars.shape}")
-    print(f"Coords shape: {coords.shape}")
+    # Add batch dimension
+    pillars_tensor = pillars_tensor.unsqueeze(0)  # [1, P, N, 9]
+    coords_tensor = coords_tensor.unsqueeze(0)    # [1, P, 4]
+
+    print(f"Input Pillars tensor shape: {pillars_tensor.shape}")
+    print(f"Input Coords tensor shape: {coords_tensor.shape}")
 
     # Initialize the model
     model = PointPillarsModel(num_classes=len(train_dataset.classes) + 1)  # +1 for background class
