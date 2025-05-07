@@ -104,12 +104,79 @@ class SSDDetectionHead(nn.Module):
         
         # Class prediction
         self.conv3 = nn.Conv2d(256, num_classes, kernel_size=3, padding=1)
+        
+        # Direction prediction (binary: forward/backward)
+        self.conv_dir = nn.Conv2d(256, 2, kernel_size=3, padding=1)
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         bbox_regression = self.conv2(x)
         class_scores = self.conv3(x)
-        return bbox_regression, class_scores
+        direction_scores = self.conv_dir(x)
+        return bbox_regression, class_scores, direction_scores
+
+class PointPillarsLoss(nn.Module):
+    def __init__(self, beta_loc=2.0, beta_cls=1.0, beta_dir=0.2,
+                 alpha=0.25, gamma=2.0):
+        super(PointPillarsLoss, self).__init__()
+        self.beta_loc = beta_loc
+        self.beta_cls = beta_cls
+        self.beta_dir = beta_dir
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')  # for direction classification
+
+    def forward(self, pred_boxes, gt_boxes, pred_cls, gt_cls,
+                pred_dir, gt_dir, pos_mask):
+        """
+        pred_boxes: [N, 7] predicted box residuals (x, y, z, w, l, h, θ)
+        gt_boxes:   [N, 7] ground truth residuals
+        pred_cls:   [N, C] class probabilities (after sigmoid or softmax)
+        gt_cls:     [N] ground truth class indices (0 = background)
+        pred_dir:   [N, 2] direction class logits
+        gt_dir:     [N] direction class indices (e.g., 0 or 1)
+        pos_mask:   [N] boolean mask for positive anchors
+        """
+
+        # Number of positive anchors
+        N_pos = pos_mask.sum().clamp(min=1).float()
+
+        # ----- Localization Loss -----
+        loc_loss = self.smooth_l1(pred_boxes[pos_mask], gt_boxes[pos_mask])
+        loc_loss = loc_loss.sum() / N_pos
+
+        # ----- Direction Classification Loss -----
+        dir_loss = self.ce_loss(pred_dir[pos_mask], gt_dir[pos_mask])
+        dir_loss = dir_loss.sum() / N_pos
+
+        # ----- Classification Loss (Focal Loss) -----
+        cls_loss = self.focal_loss(pred_cls, gt_cls)
+        cls_loss = cls_loss.sum() / N_pos
+
+        # ----- Total Loss -----
+        total_loss = (self.beta_loc * loc_loss +
+                      self.beta_cls * cls_loss +
+                      self.beta_dir * dir_loss)
+
+        return total_loss, loc_loss, cls_loss, dir_loss
+
+    def focal_loss(self, inputs, targets):
+        """
+        Focal loss for classification.
+        inputs: [N, C] logits (before softmax or sigmoid)
+        targets: [N] ground truth class indices
+        """
+        num_classes = inputs.size(1)
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
+
+        probs = F.softmax(inputs, dim=1)
+        pt = probs * targets_one_hot
+        pt = pt.sum(dim=1)  # [N]
+
+        log_pt = torch.log(pt + 1e-6)
+        focal = -self.alpha * (1 - pt) ** self.gamma * log_pt
+        return focal
 
 class PointPillarsModel(nn.Module):
     def __init__(self, num_classes, voxel_size=(0.3, 0.3), x_range=(-100, 100), y_range=(-100, 100)):
@@ -136,9 +203,9 @@ class PointPillarsModel(nn.Module):
         cnn_features = self.backbone(pseudo_image)  # [1, 128, H/4, W/4]
         
         # SSD head
-        bbox_preds, cls_scores = self.head(cnn_features)
+        bbox_preds, cls_scores, dir_scores = self.head(cnn_features)
         
-        return bbox_preds, cls_scores
+        return bbox_preds, cls_scores, dir_scores
 
 # For testing/debugging
 if __name__ == "__main__":
@@ -170,9 +237,10 @@ if __name__ == "__main__":
     model = PointPillarsModel(num_classes=len(train_dataset.classes) + 1)  # +1 for background class
 
     # Forward pass
-    bbox_preds, cls_scores = model(pillars_tensor, coords_tensor)
+    bbox_preds, cls_scores, dir_scores = model(pillars_tensor, coords_tensor)
     print(f"Bounding box predictions shape: {bbox_preds.shape}")
     print(f"Class scores shape: {cls_scores.shape}")
+    print(f"Direction scores shape: {dir_scores.shape}")
 
 
 
