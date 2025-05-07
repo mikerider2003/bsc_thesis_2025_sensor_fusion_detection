@@ -126,38 +126,68 @@ class AnchorGenerator:
         return gt_boxes, gt_classes, gt_directions, pos_mask
     
     def _calculate_iou_2d(self, anchors, gt_box):
-        """Calculate IoU between anchors and a ground truth box (2D)"""
-        # Simplified 2D IoU calculation - in practice, you'd use a more sophisticated approach
-        # This is a placeholder implementation
-        iou = np.zeros(len(anchors))
-        for i, anchor in enumerate(anchors):
-            # Calculate intersection area
-            x1 = max(anchor[0] - anchor[3]/2, gt_box[0] - gt_box[3]/2)
-            y1 = max(anchor[1] - anchor[4]/2, gt_box[1] - gt_box[4]/2)
-            x2 = min(anchor[0] + anchor[3]/2, gt_box[0] + gt_box[3]/2)
-            y2 = min(anchor[1] + anchor[4]/2, gt_box[1] + gt_box[4]/2)
-            
-            if x2 <= x1 or y2 <= y1:
-                iou[i] = 0
-                continue
-                
-            intersection = (x2 - x1) * (y2 - y1)
-            area_anchor = anchor[3] * anchor[4]
-            area_gt = gt_box[3] * gt_box[4]
-            
-            iou[i] = intersection / (area_anchor + area_gt - intersection)
-        
+        """Vectorized IoU calculation between anchors and a ground truth box (2D)."""
+        anchors = np.array(anchors)
+        gt_box = np.array(gt_box)
+
+        # Anchor corners
+        x1_anchors = anchors[:, 0] - anchors[:, 3] / 2
+        y1_anchors = anchors[:, 1] - anchors[:, 4] / 2
+        x2_anchors = anchors[:, 0] + anchors[:, 3] / 2
+        y2_anchors = anchors[:, 1] + anchors[:, 4] / 2
+
+        # Ground truth box corners
+        x1_gt = gt_box[0] - gt_box[3] / 2
+        y1_gt = gt_box[1] - gt_box[4] / 2
+        x2_gt = gt_box[0] + gt_box[3] / 2
+        y2_gt = gt_box[1] + gt_box[4] / 2
+
+        # Intersection
+        x1_inter = np.maximum(x1_anchors, x1_gt)
+        y1_inter = np.maximum(y1_anchors, y1_gt)
+        x2_inter = np.minimum(x2_anchors, x2_gt)
+        y2_inter = np.minimum(y2_anchors, y2_gt)
+
+        inter_area = np.maximum(0, x2_inter - x1_inter) * np.maximum(0, y2_inter - y1_inter)
+
+        # Union
+        anchor_area = (x2_anchors - x1_anchors) * (y2_anchors - y1_anchors)
+        gt_area = (x2_gt - x1_gt) * (y2_gt - y1_gt)
+        union_area = anchor_area + gt_area - inter_area
+
+        # IoU
+        iou = inter_area / np.maximum(union_area, 1e-6)
         return iou
         
     def _get_category_id(self, category):
-        """Convert category string to ID - customize based on your dataset"""
+        """Convert category string to ID based on the full dataset classes"""
         categories = {
             'REGULAR_VEHICLE': 0,
-            'PEDESTRIAN': 1,
-            'CYCLIST': 2,
-            'LARGE_VEHICLE': 3
+            'PEDESTRIAN': 1, 
+            'BICYCLE': 2,
+            'BICYCLIST': 3,
+            'MOTORCYCLE': 4,
+            'MOTORCYCLIST': 5,
+            'BOX_TRUCK': 6,
+            'TRUCK': 7,
+            'TRUCK_CAB': 8,
+            'LARGE_VEHICLE': 9,
+            'BUS': 10,
+            'ARTICULATED_BUS': 11,
+            'VEHICULAR_TRAILER': 12,
+            'CONSTRUCTION_CONE': 13,
+            'CONSTRUCTION_BARREL': 14,
+            'SIGN': 15,
+            'STOP_SIGN': 16,
+            'BOLLARD': 17,
+            'OFFICIAL_SIGNALER': 18,
+            'STROLLER': 19,
+            'DOG': 20,
+            'WHEELED_DEVICE': 21
         }
-        return categories.get(category, 0)
+        
+        # Return the category ID or a default value (could use -1 to flag unknown classes)
+        return categories.get(category, 0)  # Default to REGULAR_VEHICLE if unknown
 
 
 def parse_args():
@@ -197,7 +227,7 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
     train_dataset = PointPillarsLoader(dataset_path, split='train')
     
     # Process all samples (or a subset for faster development)
-    processed_samples = train_dataset.process_all_samples(limit=16)
+    processed_samples = train_dataset.process_all_samples()
     
     # Get indices for train/validation split
     indices = list(range(len(processed_samples)))
@@ -303,10 +333,37 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, anchor_ge
             
             # Default anchor sizes for common classes (l, w, h)
             anchor_sizes = [
-                (4.5, 2.0, 1.6),  # Car
-                (0.8, 0.8, 1.7),  # Pedestrian
-                (2.0, 1.0, 1.7),  # Cyclist
-                (8.0, 2.5, 2.5)   # Large vehicle
+                # Small road users
+                (0.8, 0.8, 1.7),  # PEDESTRIAN
+                (0.6, 0.6, 1.2),  # STROLLER
+                (0.8, 0.4, 0.6),  # DOG
+                
+                # Bicycles and motorcycles
+                (1.8, 0.6, 1.2),  # BICYCLE
+                (2.0, 0.8, 1.7),  # BICYCLIST
+                (2.2, 0.9, 1.4),  # MOTORCYCLE
+                (2.2, 0.9, 1.8),  # MOTORCYCLIST
+                (1.0, 0.6, 1.0),  # WHEELED_DEVICE
+                
+                # Standard vehicles
+                (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
+                
+                # Large vehicles
+                (6.5, 2.3, 2.3),  # TRUCK
+                (8.0, 2.5, 2.5),  # LARGE_VEHICLE
+                (6.0, 2.3, 3.0),  # BUS
+                (12.0, 2.5, 3.2),  # ARTICULATED_BUS
+                (5.5, 2.5, 2.5),  # BOX_TRUCK
+                (4.0, 2.3, 2.5),  # TRUCK_CAB
+                (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
+                
+                # Static objects
+                (1.0, 1.0, 2.0),  # SIGN
+                (0.5, 0.5, 2.0),  # STOP_SIGN
+                (0.4, 0.4, 1.0),  # BOLLARD
+                (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
+                (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
+                (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
             ]
             
             anchor_generator = AnchorGenerator(
@@ -384,10 +441,37 @@ def validate(model, val_loader, criterion, device, anchor_generator=None):
                 
                 # Default anchor sizes for common classes (l, w, h)
                 anchor_sizes = [
-                    (4.5, 2.0, 1.6),  # Car
-                    (0.8, 0.8, 1.7),  # Pedestrian
-                    (2.0, 1.0, 1.7),  # Cyclist
-                    (8.0, 2.5, 2.5)   # Large vehicle
+                    # Small road users
+                    (0.8, 0.8, 1.7),  # PEDESTRIAN
+                    (0.6, 0.6, 1.2),  # STROLLER
+                    (0.8, 0.4, 0.6),  # DOG
+                    
+                    # Bicycles and motorcycles
+                    (1.8, 0.6, 1.2),  # BICYCLE
+                    (2.0, 0.8, 1.7),  # BICYCLIST
+                    (2.2, 0.9, 1.4),  # MOTORCYCLE
+                    (2.2, 0.9, 1.8),  # MOTORCYCLIST
+                    (1.0, 0.6, 1.0),  # WHEELED_DEVICE
+                    
+                    # Standard vehicles
+                    (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
+                    
+                    # Large vehicles
+                    (6.5, 2.3, 2.3),  # TRUCK
+                    (8.0, 2.5, 2.5),  # LARGE_VEHICLE
+                    (6.0, 2.3, 3.0),  # BUS
+                    (12.0, 2.5, 3.2),  # ARTICULATED_BUS
+                    (5.5, 2.5, 2.5),  # BOX_TRUCK
+                    (4.0, 2.3, 2.5),  # TRUCK_CAB
+                    (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
+                    
+                    # Static objects
+                    (1.0, 1.0, 2.0),  # SIGN
+                    (0.5, 0.5, 2.0),  # STOP_SIGN
+                    (0.4, 0.4, 1.0),  # BOLLARD
+                    (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
+                    (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
+                    (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
                 ]
                 
                 anchor_generator = AnchorGenerator(
@@ -503,10 +587,37 @@ def main():
     
     # Default anchor sizes for common classes (l, w, h)
     anchor_sizes = [
-        (4.5, 2.0, 1.6),  # Car
-        (0.8, 0.8, 1.7),  # Pedestrian
-        (2.0, 1.0, 1.7),  # Cyclist
-        (8.0, 2.5, 2.5)   # Large vehicle
+        # Small road users
+        (0.8, 0.8, 1.7),  # PEDESTRIAN
+        (0.6, 0.6, 1.2),  # STROLLER
+        (0.8, 0.4, 0.6),  # DOG
+        
+        # Bicycles and motorcycles
+        (1.8, 0.6, 1.2),  # BICYCLE
+        (2.0, 0.8, 1.7),  # BICYCLIST
+        (2.2, 0.9, 1.4),  # MOTORCYCLE
+        (2.2, 0.9, 1.8),  # MOTORCYCLIST
+        (1.0, 0.6, 1.0),  # WHEELED_DEVICE
+        
+        # Standard vehicles
+        (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
+        
+        # Large vehicles
+        (6.5, 2.3, 2.3),  # TRUCK
+        (8.0, 2.5, 2.5),  # LARGE_VEHICLE
+        (6.0, 2.3, 3.0),  # BUS
+        (12.0, 2.5, 3.2),  # ARTICULATED_BUS
+        (5.5, 2.5, 2.5),  # BOX_TRUCK
+        (4.0, 2.3, 2.5),  # TRUCK_CAB
+        (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
+        
+        # Static objects
+        (1.0, 1.0, 2.0),  # SIGN
+        (0.5, 0.5, 2.0),  # STOP_SIGN
+        (0.4, 0.4, 1.0),  # BOLLARD
+        (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
+        (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
+        (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
     ]
     
     anchor_generator = AnchorGenerator(
