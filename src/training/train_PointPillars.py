@@ -170,30 +170,24 @@ class AnchorGenerator:
             'MOTORCYCLIST': 5,
             'BOX_TRUCK': 6,
             'TRUCK': 7,
-            'TRUCK_CAB': 8,
-            'LARGE_VEHICLE': 9,
-            'BUS': 10,
-            'ARTICULATED_BUS': 11,
-            'VEHICULAR_TRAILER': 12,
-            'CONSTRUCTION_CONE': 13,
-            'CONSTRUCTION_BARREL': 14,
-            'SIGN': 15,
-            'STOP_SIGN': 16,
-            'BOLLARD': 17,
-            'OFFICIAL_SIGNALER': 18,
-            'STROLLER': 19,
-            'DOG': 20,
-            'WHEELED_DEVICE': 21
+            'LARGE_VEHICLE': 8,
+            'BUS': 9,
+            'ARTICULATED_BUS': 10,
+            'CONSTRUCTION_CONE': 11,
+            'CONSTRUCTION_BARREL': 12,
+            'SIGN': 13,
+            'STOP_SIGN': 14,
+            'BOLLARD': 15
         }
         
-        # Return the category ID or a default value (could use -1 to flag unknown classes)
-        return categories.get(category, 0)  # Default to REGULAR_VEHICLE if unknown
+        # Return the category ID or a default value (e.g., -1 for unknown classes)
+        return categories.get(category, -1)  # Default to -1 for unknown classes
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train PointPillars model')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--metrics_dir', type=str, default='outputs/metrics', help='Directory to save training metrics')
@@ -335,15 +329,12 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, anchor_ge
             anchor_sizes = [
                 # Small road users
                 (0.8, 0.8, 1.7),  # PEDESTRIAN
-                (0.6, 0.6, 1.2),  # STROLLER
-                (0.8, 0.4, 0.6),  # DOG
                 
                 # Bicycles and motorcycles
                 (1.8, 0.6, 1.2),  # BICYCLE
                 (2.0, 0.8, 1.7),  # BICYCLIST
                 (2.2, 0.9, 1.4),  # MOTORCYCLE
                 (2.2, 0.9, 1.8),  # MOTORCYCLIST
-                (1.0, 0.6, 1.0),  # WHEELED_DEVICE
                 
                 # Standard vehicles
                 (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
@@ -354,14 +345,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, anchor_ge
                 (6.0, 2.3, 3.0),  # BUS
                 (12.0, 2.5, 3.2),  # ARTICULATED_BUS
                 (5.5, 2.5, 2.5),  # BOX_TRUCK
-                (4.0, 2.3, 2.5),  # TRUCK_CAB
-                (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
                 
                 # Static objects
                 (1.0, 1.0, 2.0),  # SIGN
                 (0.5, 0.5, 2.0),  # STOP_SIGN
                 (0.4, 0.4, 1.0),  # BOLLARD
-                (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
                 (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
                 (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
             ]
@@ -443,15 +431,12 @@ def validate(model, val_loader, criterion, device, anchor_generator=None):
                 anchor_sizes = [
                     # Small road users
                     (0.8, 0.8, 1.7),  # PEDESTRIAN
-                    (0.6, 0.6, 1.2),  # STROLLER
-                    (0.8, 0.4, 0.6),  # DOG
                     
                     # Bicycles and motorcycles
                     (1.8, 0.6, 1.2),  # BICYCLE
                     (2.0, 0.8, 1.7),  # BICYCLIST
                     (2.2, 0.9, 1.4),  # MOTORCYCLE
                     (2.2, 0.9, 1.8),  # MOTORCYCLIST
-                    (1.0, 0.6, 1.0),  # WHEELED_DEVICE
                     
                     # Standard vehicles
                     (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
@@ -462,14 +447,11 @@ def validate(model, val_loader, criterion, device, anchor_generator=None):
                     (6.0, 2.3, 3.0),  # BUS
                     (12.0, 2.5, 3.2),  # ARTICULATED_BUS
                     (5.5, 2.5, 2.5),  # BOX_TRUCK
-                    (4.0, 2.3, 2.5),  # TRUCK_CAB
-                    (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
                     
                     # Static objects
                     (1.0, 1.0, 2.0),  # SIGN
                     (0.5, 0.5, 2.0),  # STOP_SIGN
                     (0.4, 0.4, 1.0),  # BOLLARD
-                    (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
                     (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
                     (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
                 ]
@@ -589,15 +571,12 @@ def main():
     anchor_sizes = [
         # Small road users
         (0.8, 0.8, 1.7),  # PEDESTRIAN
-        (0.6, 0.6, 1.2),  # STROLLER
-        (0.8, 0.4, 0.6),  # DOG
         
         # Bicycles and motorcycles
         (1.8, 0.6, 1.2),  # BICYCLE
         (2.0, 0.8, 1.7),  # BICYCLIST
         (2.2, 0.9, 1.4),  # MOTORCYCLE
         (2.2, 0.9, 1.8),  # MOTORCYCLIST
-        (1.0, 0.6, 1.0),  # WHEELED_DEVICE
         
         # Standard vehicles
         (4.5, 2.0, 1.6),  # REGULAR_VEHICLE
@@ -608,14 +587,11 @@ def main():
         (6.0, 2.3, 3.0),  # BUS
         (12.0, 2.5, 3.2),  # ARTICULATED_BUS
         (5.5, 2.5, 2.5),  # BOX_TRUCK
-        (4.0, 2.3, 2.5),  # TRUCK_CAB
-        (6.0, 2.3, 2.0),  # VEHICULAR_TRAILER
         
         # Static objects
         (1.0, 1.0, 2.0),  # SIGN
         (0.5, 0.5, 2.0),  # STOP_SIGN
         (0.4, 0.4, 1.0),  # BOLLARD
-        (1.2, 1.0, 1.8),  # OFFICIAL_SIGNALER
         (0.5, 0.5, 0.8),  # CONSTRUCTION_CONE
         (0.6, 0.6, 1.0),  # CONSTRUCTION_BARREL
     ]
