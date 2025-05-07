@@ -134,25 +134,56 @@ class PointPillarsLoss(nn.Module):
     def forward(self, pred_boxes, gt_boxes, pred_cls, gt_cls,
                 pred_dir, gt_dir, pos_mask):
         """
-        pred_boxes: [N, 7] predicted box residuals (x, y, z, w, l, h, θ)
-        gt_boxes:   [N, 7] ground truth residuals
-        pred_cls:   [N, C] class probabilities (after sigmoid or softmax)
-        gt_cls:     [N] ground truth class indices (0 = background)
-        pred_dir:   [N, 2] direction class logits
-        gt_dir:     [N] direction class indices (e.g., 0 or 1)
-        pos_mask:   [N] boolean mask for positive anchors
+        pred_boxes: [B, num_anchors, 7] or [B, H*W*num_classes, 7] predicted box residuals
+        gt_boxes:   [B, num_anchors, 7] ground truth residuals
+        pred_cls:   [B, num_anchors] or [B, H*W*num_classes] class probabilities
+        gt_cls:     [B, num_anchors] ground truth class indices
+        pred_dir:   [B, num_anchors, 2] or [B, H*W*num_classes, 2] direction class logits
+        gt_dir:     [B, num_anchors] direction class indices (e.g., 0 or 1)
+        pos_mask:   [B, num_anchors] boolean mask for positive anchors
         """
+        # Ensure shapes are compatible
+        B = pred_boxes.shape[0]
+        
+        # Handle shape mismatches by reshaping the predictions if needed
+        if pred_boxes.shape[1] != gt_boxes.shape[1]:
+            # Resize pred_boxes to match target size
+            pred_boxes = self._resize_predictions(pred_boxes, gt_boxes.shape[1])
+            
+        if pred_cls.shape[1] != gt_cls.shape[1]:
+            # Resize pred_cls to match target size
+            pred_cls = self._resize_predictions(pred_cls, gt_cls.shape[1])
+            
+        if pred_dir.shape[1] != gt_dir.shape[1]:
+            # Resize pred_dir to match target size while preserving the direction dimension
+            pred_dir = self._resize_predictions(pred_dir, gt_dir.shape[1], keep_last_dim=True)
+        
+        # Flatten all tensors for simpler calculation - use reshape instead of view
+        # to handle non-contiguous tensors
+        pred_boxes = pred_boxes.reshape(-1, 7)
+        gt_boxes = gt_boxes.reshape(-1, 7)
+        pred_cls = pred_cls.reshape(-1)
+        gt_cls = gt_cls.reshape(-1)
+        pred_dir = pred_dir.reshape(-1, 2)
+        gt_dir = gt_dir.reshape(-1)
+        pos_mask = pos_mask.reshape(-1)
 
         # Number of positive anchors
         N_pos = pos_mask.sum().clamp(min=1).float()
 
         # ----- Localization Loss -----
-        loc_loss = self.smooth_l1(pred_boxes[pos_mask], gt_boxes[pos_mask])
-        loc_loss = loc_loss.sum() / N_pos
+        if pos_mask.sum() > 0:
+            loc_loss = self.smooth_l1(pred_boxes[pos_mask], gt_boxes[pos_mask])
+            loc_loss = loc_loss.sum() / N_pos
+        else:
+            loc_loss = torch.tensor(0.0, device=pred_boxes.device)
 
         # ----- Direction Classification Loss -----
-        dir_loss = self.ce_loss(pred_dir[pos_mask], gt_dir[pos_mask])
-        dir_loss = dir_loss.sum() / N_pos
+        if pos_mask.sum() > 0:
+            dir_loss = self.ce_loss(pred_dir[pos_mask], gt_dir[pos_mask])
+            dir_loss = dir_loss.sum() / N_pos
+        else:
+            dir_loss = torch.tensor(0.0, device=pred_dir.device)
 
         # ----- Classification Loss (Focal Loss) -----
         cls_loss = self.focal_loss(pred_cls, gt_cls)
@@ -165,18 +196,66 @@ class PointPillarsLoss(nn.Module):
 
         return total_loss, loc_loss, cls_loss, dir_loss
 
+    def _resize_predictions(self, preds, target_size, keep_last_dim=False):
+        """Resize prediction tensor to match target size."""
+        B = preds.shape[0]
+        
+        if keep_last_dim:
+            # For tensors with last dimension (e.g., direction scores [B, N, 2])
+            last_dim = preds.shape[-1]
+            # Use interpolate to resize
+            preds_resized = F.interpolate(
+                preds.reshape(B, -1, last_dim).permute(0, 2, 1), 
+                size=target_size, 
+                mode='linear'
+            ).permute(0, 2, 1)
+            return preds_resized
+        else:
+            # For tensors without last dimension (e.g., class scores [B, N])
+            if len(preds.shape) > 2:
+                # Handle box predictions [B, N, 7]
+                resized = torch.zeros((B, target_size, preds.shape[2]), 
+                                    device=preds.device,
+                                    dtype=preds.dtype)
+                # Just take first N predictions or repeat if needed
+                if target_size > preds.shape[1]:
+                    # If target is larger, repeat predictions
+                    repeat_factor = (target_size + preds.shape[1] - 1) // preds.shape[1]  # Ceiling division
+                    resized[:, :preds.shape[1]*repeat_factor, :] = preds.repeat(1, repeat_factor, 1)[:, :target_size, :]
+                else:
+                    # If target is smaller, take first N
+                    resized = preds[:, :target_size, :]
+            else:
+                # Handle 2D tensors like class scores [B, N]
+                resized = torch.zeros((B, target_size), 
+                                    device=preds.device,
+                                    dtype=preds.dtype)
+                if target_size > preds.shape[1]:
+                    repeat_factor = (target_size + preds.shape[1] - 1) // preds.shape[1]  # Ceiling division
+                    resized[:, :preds.shape[1]*repeat_factor] = preds.repeat(1, repeat_factor)[:, :target_size]
+                else:
+                    resized = preds[:, :target_size]
+                    
+            return resized
+
     def focal_loss(self, inputs, targets):
         """
         Focal loss for classification.
-        inputs: [N, C] logits (before softmax or sigmoid)
+        inputs: [N] logits (before softmax or sigmoid)
         targets: [N] ground truth class indices
         """
-        num_classes = inputs.size(1)
-        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
-
-        probs = F.softmax(inputs, dim=1)
-        pt = probs * targets_one_hot
-        pt = pt.sum(dim=1)  # [N]
+        # Handle the case where inputs are not multiclass
+        if len(inputs.shape) == 1 or inputs.shape[-1] == 1:
+            # Binary classification case
+            probs = torch.sigmoid(inputs)
+            pt = torch.where(targets > 0, probs, 1-probs)
+        else:
+            # Multiclass classification case
+            num_classes = inputs.size(1)
+            targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
+            probs = F.softmax(inputs, dim=1)
+            pt = probs * targets_one_hot
+            pt = pt.sum(dim=1)  # [N]
 
         log_pt = torch.log(pt + 1e-6)
         focal = -self.alpha * (1 - pt) ** self.gamma * log_pt

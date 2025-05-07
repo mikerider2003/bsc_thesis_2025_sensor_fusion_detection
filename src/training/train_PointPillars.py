@@ -14,6 +14,152 @@ from src.models.PointPillars import PointPillarsModel, PointPillarsLoss
 from src.loaders.loader_Point_Pillars import PointPillarsLoader
 
 
+class AnchorGenerator:
+    """Generates anchors for PointPillars detection"""
+    
+    def __init__(self, x_range, y_range, z_range, voxel_size, anchor_sizes, rotations=(0, np.pi/2)):
+        """
+        Args:
+            x_range: (min, max) in meters
+            y_range: (min, max) in meters
+            z_range: (min, max) in meters
+            voxel_size: (x_size, y_size) in meters
+            anchor_sizes: list of (length, width, height) for each class
+            rotations: list of rotations to apply to anchors
+        """
+        self.x_range = x_range
+        self.y_range = y_range
+        self.z_range = z_range
+        self.voxel_size = voxel_size
+        self.anchor_sizes = anchor_sizes
+        self.rotations = rotations
+        
+        # Calculate grid dimensions
+        self.nx = int((x_range[1] - x_range[0]) / voxel_size[0] / 4)  # /4 due to backbone downsampling
+        self.ny = int((y_range[1] - y_range[0]) / voxel_size[1] / 4)  # /4 due to backbone downsampling
+        
+        # Generate anchors
+        self.anchors = self._generate_anchors()
+        
+    def _generate_anchors(self):
+        """Generate anchor boxes for all positions in the feature map"""
+        anchors = []
+        x_centers = np.linspace(self.x_range[0], self.x_range[1], self.nx)
+        y_centers = np.linspace(self.y_range[0], self.y_range[1], self.ny)
+        
+        # Use mean of z_range as anchor height
+        z_center = (self.z_range[0] + self.z_range[1]) / 2
+        
+        # Generate anchors for each position
+        for x in x_centers:
+            for y in y_centers:
+                for size in self.anchor_sizes:
+                    length, width, height = size
+                    for rotation in self.rotations:
+                        anchors.append([x, y, z_center, length, width, height, rotation])
+        
+        return np.array(anchors)
+    
+    def encode_targets(self, batch_annotations):
+        """
+        Encode ground truth boxes to match anchor format
+        
+        Returns:
+            gt_boxes: tensor of shape [batch_size, num_anchors, 7]
+            gt_classes: tensor of shape [batch_size, num_anchors]
+            gt_directions: tensor of shape [batch_size, num_anchors]
+            pos_mask: tensor of shape [batch_size, num_anchors]
+        """
+        batch_size = len(batch_annotations)
+        num_anchors = len(self.anchors)
+        
+        gt_boxes = torch.zeros((batch_size, num_anchors, 7), dtype=torch.float32)
+        gt_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long)
+        gt_directions = torch.zeros((batch_size, num_anchors), dtype=torch.long)
+        pos_mask = torch.zeros((batch_size, num_anchors), dtype=torch.bool)
+        
+        # For each batch item
+        for b, annotations in enumerate(batch_annotations):
+            # Skip if no annotations
+            if annotations is None or len(annotations) == 0:
+                continue
+                
+            # Convert annotations to tensor format [N, 7] - (x, y, z, l, w, h, yaw)
+            num_gt = len(annotations)
+            gt_boxes_raw = torch.zeros((num_gt, 7), dtype=torch.float32)
+            
+            # Extract values from annotations
+            for i, anno in enumerate(annotations.iterrows()):
+                anno = anno[1]  # Get the pandas Series from the tuple
+                
+                # Get box center and dimensions
+                x, y, z = anno['tx_m'], anno['ty_m'], anno['tz_m']
+                l, w, h = anno['length_m'], anno['width_m'], anno['height_m']
+                
+                # Convert quaternion to yaw (rotation around z-axis)
+                qw, qx, qy, qz = anno['qw'], anno['qx'], anno['qy'], anno['qz']
+                yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
+                
+                # Store in tensor
+                gt_boxes_raw[i] = torch.tensor([x, y, z, l, w, h, yaw])
+                
+                # Get category ID
+                category = anno['category']
+                category_id = self._get_category_id(category) + 1  # Add 1 to skip background (0)
+                
+                # Find matching anchors (IoU > threshold)
+                # For simplicity, assign to closest anchor
+                ious = self._calculate_iou_2d(self.anchors, gt_boxes_raw[i].numpy())
+                max_iou_idx = np.argmax(ious)
+                
+                # Assign ground truth to this anchor
+                gt_boxes[b, max_iou_idx] = gt_boxes_raw[i]
+                gt_classes[b, max_iou_idx] = category_id
+                
+                # Determine direction class (0: forward, 1: backward)
+                # This is a simplified approach; you may need to adjust based on your dataset
+                gt_directions[b, max_iou_idx] = 0 if yaw > 0 else 1
+                
+                # Mark this anchor as positive
+                pos_mask[b, max_iou_idx] = True
+            
+        return gt_boxes, gt_classes, gt_directions, pos_mask
+    
+    def _calculate_iou_2d(self, anchors, gt_box):
+        """Calculate IoU between anchors and a ground truth box (2D)"""
+        # Simplified 2D IoU calculation - in practice, you'd use a more sophisticated approach
+        # This is a placeholder implementation
+        iou = np.zeros(len(anchors))
+        for i, anchor in enumerate(anchors):
+            # Calculate intersection area
+            x1 = max(anchor[0] - anchor[3]/2, gt_box[0] - gt_box[3]/2)
+            y1 = max(anchor[1] - anchor[4]/2, gt_box[1] - gt_box[4]/2)
+            x2 = min(anchor[0] + anchor[3]/2, gt_box[0] + gt_box[3]/2)
+            y2 = min(anchor[1] + anchor[4]/2, gt_box[1] + gt_box[4]/2)
+            
+            if x2 <= x1 or y2 <= y1:
+                iou[i] = 0
+                continue
+                
+            intersection = (x2 - x1) * (y2 - y1)
+            area_anchor = anchor[3] * anchor[4]
+            area_gt = gt_box[3] * gt_box[4]
+            
+            iou[i] = intersection / (area_anchor + area_gt - intersection)
+        
+        return iou
+        
+    def _get_category_id(self, category):
+        """Convert category string to ID - customize based on your dataset"""
+        categories = {
+            'REGULAR_VEHICLE': 0,
+            'PEDESTRIAN': 1,
+            'CYCLIST': 2,
+            'LARGE_VEHICLE': 3
+        }
+        return categories.get(category, 0)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train PointPillars model')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
@@ -61,13 +207,16 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
     train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(train_dataset, val_indices)
     
+    # Set num_workers=0 for MacOS MPS compatibility
+    num_workers = 0  # Better for MPS backend
+    
     # Create data loaders
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=False,  # Don't use pin_memory on MPS
         collate_fn=collate_fn
     )
     
@@ -75,8 +224,8 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
         val_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=False,  # Don't use pin_memory on MPS
         collate_fn=collate_fn
     )
     
@@ -129,7 +278,7 @@ def collate_fn(batch):
     }
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device):
+def train_one_epoch(model, train_loader, criterion, optimizer, device, anchor_generator=None):
     """Train for one epoch"""
     model.train()
     total_loss = 0
@@ -144,18 +293,53 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         # Forward pass
         bbox_preds, cls_scores, dir_scores = model(pillars, coords)
         
-        # TODO: Convert targets to expected format for loss calculation
-        # This depends on how you've structured your targets and loss function
-        pred_boxes = ...  # Extract from model outputs
-        gt_boxes = ...  # Extract from targets
-        pred_cls = ...
-        gt_cls = ...
-        pred_dir = ...
-        gt_dir = ...
-        pos_mask = ...  # Positive anchor mask
+        # Process targets using anchor generator
+        if anchor_generator is None:
+            # Create default anchor generator if not provided
+            x_range = (-100, 100)
+            y_range = (-100, 100)
+            z_range = (-3, 1)
+            voxel_size = (0.3, 0.3)
+            
+            # Default anchor sizes for common classes (l, w, h)
+            anchor_sizes = [
+                (4.5, 2.0, 1.6),  # Car
+                (0.8, 0.8, 1.7),  # Pedestrian
+                (2.0, 1.0, 1.7),  # Cyclist
+                (8.0, 2.5, 2.5)   # Large vehicle
+            ]
+            
+            anchor_generator = AnchorGenerator(
+                x_range, y_range, z_range, voxel_size, anchor_sizes
+            )
+        
+        # Encode targets
+        gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
+        
+        # Move tensors to device
+        gt_boxes = gt_boxes.to(device)
+        gt_cls = gt_cls.to(device)
+        gt_dir = gt_dir.to(device)
+        pos_mask = pos_mask.to(device)
+        
+        # Reshape network outputs to match target format
+        B, C7, H, W = bbox_preds.shape
+        num_classes = C7 // 7
+        
+        # Use reshape instead of view to handle non-contiguous tensors
+        # Reshape bbox_preds: [B, C*7, H, W] -> [B, H*W*num_classes, 7]
+        pred_boxes = bbox_preds.reshape(B, num_classes, 7, H, W).permute(0, 3, 4, 1, 2).reshape(B, -1, 7)
+        
+        # Reshape cls_scores: [B, C, H, W] -> [B, H*W*num_classes]
+        pred_cls = cls_scores.permute(0, 2, 3, 1).reshape(B, -1)
+        
+        # Reshape dir_scores: [B, 2, H, W] -> [B, H*W*num_classes, 2]
+        pred_dir = dir_scores.permute(0, 2, 3, 1).reshape(B, -1, 2)
         
         # Calculate loss
-        loss = criterion(pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask)
+        loss, loc_loss, cls_loss, dir_loss = criterion(
+            pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask
+        )
         
         # Backward pass and optimize
         optimizer.zero_grad()
@@ -164,12 +348,17 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         
         # Update progress
         total_loss += loss.item()
-        progress_bar.set_postfix({"batch_loss": loss.item()})
+        progress_bar.set_postfix({
+            "batch_loss": loss.item(), 
+            "loc_loss": loc_loss.item(),
+            "cls_loss": cls_loss.item(),
+            "dir_loss": dir_loss.item()
+        })
     
     return total_loss / len(train_loader)
 
 
-def validate(model, val_loader, criterion, device):
+def validate(model, val_loader, criterion, device, anchor_generator=None):
     """Validate the model"""
     model.eval()
     total_loss = 0
@@ -185,22 +374,62 @@ def validate(model, val_loader, criterion, device):
             # Forward pass
             bbox_preds, cls_scores, dir_scores = model(pillars, coords)
             
-            # TODO: Convert targets to expected format for loss calculation
-            # Similar to the training function
-            pred_boxes = ...
-            gt_boxes = ...
-            pred_cls = ...
-            gt_cls = ...
-            pred_dir = ...
-            gt_dir = ...
-            pos_mask = ...
+            # Process targets using anchor generator
+            if anchor_generator is None:
+                # Create default anchor generator if not provided
+                x_range = (-100, 100)
+                y_range = (-100, 100)
+                z_range = (-3, 1)
+                voxel_size = (0.3, 0.3)
+                
+                # Default anchor sizes for common classes (l, w, h)
+                anchor_sizes = [
+                    (4.5, 2.0, 1.6),  # Car
+                    (0.8, 0.8, 1.7),  # Pedestrian
+                    (2.0, 1.0, 1.7),  # Cyclist
+                    (8.0, 2.5, 2.5)   # Large vehicle
+                ]
+                
+                anchor_generator = AnchorGenerator(
+                    x_range, y_range, z_range, voxel_size, anchor_sizes
+                )
+            
+            # Encode targets
+            gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
+            
+            # Move tensors to device
+            gt_boxes = gt_boxes.to(device)
+            gt_cls = gt_cls.to(device)
+            gt_dir = gt_dir.to(device)
+            pos_mask = pos_mask.to(device)
+            
+            # Reshape network outputs to match target format
+            B, C7, H, W = bbox_preds.shape
+            num_classes = C7 // 7
+            
+            # Use reshape instead of view to handle non-contiguous tensors
+            # Reshape bbox_preds: [B, C*7, H, W] -> [B, H*W*num_classes, 7]
+            pred_boxes = bbox_preds.reshape(B, num_classes, 7, H, W).permute(0, 3, 4, 1, 2).reshape(B, -1, 7)
+            
+            # Reshape cls_scores: [B, C, H, W] -> [B, H*W*num_classes]
+            pred_cls = cls_scores.permute(0, 2, 3, 1).reshape(B, -1)
+            
+            # Reshape dir_scores: [B, 2, H, W] -> [B, H*W*num_classes, 2]
+            pred_dir = dir_scores.permute(0, 2, 3, 1).reshape(B, -1, 2)
             
             # Calculate loss
-            loss = criterion(pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask)
+            loss, loc_loss, cls_loss, dir_loss = criterion(
+                pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask
+            )
             
             # Update progress
             total_loss += loss.item()
-            progress_bar.set_postfix({"batch_loss": loss.item()})
+            progress_bar.set_postfix({
+                "batch_loss": loss.item(),
+                "loc_loss": loc_loss.item(),
+                "cls_loss": cls_loss.item(),
+                "dir_loss": dir_loss.item()
+            })
     
     return total_loss / len(val_loader)
 
@@ -234,21 +463,29 @@ def main():
         seed=args.seed
     )
 
-    for batch_idx, batch in enumerate(train_loader):
-        print("\nInspecting batch:", batch_idx)
-        print(f"Pillars shape: {batch['pillars'].shape}")
-        print(f"Coords shape: {batch['coords'].shape}")
-        print(f"Number of targets: {len(batch['targets'])}")
+    # Debug: Inspect a few batches to verify data format
+    # print("\n=== Inspecting Data Batches ===")
+    # for batch_idx, batch in enumerate(train_loader):
+    #     if batch_idx >= 2:  # Only inspect first two batches
+    #         break
+    #     print("\nInspecting train batch:", batch_idx)
+    #     print(f"Pillars shape: {batch['pillars'].shape}")
+    #     print(f"Coords shape: {batch['coords'].shape}")
+    #     print(f"Number of targets: {len(batch['targets'])}")
 
-    for batch_idx, batch in enumerate(val_loader):
-        print("\nInspecting validation batch:", batch_idx)
-        print(f"Pillars shape: {batch['pillars'].shape}")
-        print(f"Coords shape: {batch['coords'].shape}")
-        print(f"Number of targets: {len(batch['targets'])}")
+    # for batch_idx, batch in enumerate(val_loader):
+    #     if batch_idx >= 2:  # Only inspect first two batches
+    #         break
+    #     print("\nInspecting validation batch:", batch_idx)
+    #     print(f"Pillars shape: {batch['pillars'].shape}")
+    #     print(f"Coords shape: {batch['coords'].shape}")
+    #     print(f"Number of targets: {len(batch['targets'])}")
     
-    return
+    print("\n=== Starting Training ===")
+    
     # Get number of classes from dataset
     num_classes = len(train_loader.dataset.dataset.classes) + 1  # +1 for background
+    print(f"Training with {num_classes} classes")
     
     # Initialize model and loss
     model = PointPillarsModel(num_classes=num_classes).to(device)
@@ -256,7 +493,25 @@ def main():
     
     # Initialize optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    # Create anchor generator for target encoding
+    x_range = (-100, 100)
+    y_range = (-100, 100)
+    z_range = (-3, 1)
+    voxel_size = (0.3, 0.3)
+    
+    # Default anchor sizes for common classes (l, w, h)
+    anchor_sizes = [
+        (4.5, 2.0, 1.6),  # Car
+        (0.8, 0.8, 1.7),  # Pedestrian
+        (2.0, 1.0, 1.7),  # Cyclist
+        (8.0, 2.5, 2.5)   # Large vehicle
+    ]
+    
+    anchor_generator = AnchorGenerator(
+        x_range, y_range, z_range, voxel_size, anchor_sizes
+    )
     
     # Training loop
     best_val_loss = float('inf')
@@ -264,10 +519,10 @@ def main():
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, anchor_generator)
         
         # Validate
-        val_loss = validate(model, val_loader, criterion, device)
+        val_loss = validate(model, val_loader, criterion, device, anchor_generator)
         
         # Update learning rate scheduler
         current_lr = optimizer.param_groups[0]['lr']

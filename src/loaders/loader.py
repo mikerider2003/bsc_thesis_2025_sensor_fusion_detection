@@ -134,6 +134,17 @@ if __name__ == "__main__":
     # Create dataset and loader
     train_dataset = ArgoDataset(dataset_path, split='train')
 
+    sample = train_dataset[0]
+    # print sample annotations.columns
+    print(f"{sample['annotations'].columns}")
+    print(train_dataset.classes)
+
+#     Index(['timestamp_ns', 'track_uuid', 'category', 'length_m', 'width_m',
+#        'height_m', 'qw', 'qx', 'qy', 'qz', 'tx_m', 'ty_m', 'tz_m',
+#        'num_interior_pts'],
+#       dtype='object')
+# {'BOX_TRUCK', 'BICYCLE', 'MOTORCYCLE', 'SIGN', 'REGULAR_VEHICLE', 'LARGE_VEHICLE', 'TRUCK_CAB', 'MOTORCYCLIST', 'VEHICULAR_TRAILER', 'CONSTRUCTION_CONE', 'PEDESTRIAN', 'OFFICIAL_SIGNALER', 'TRUCK', 'STOP_SIGN', 'BOLLARD', 'STROLLER', 'DOG', 'BUS', 'BICYCLIST', 'ARTICULATED_BUS', 'WHEELED_DEVICE', 'CONSTRUCTION_BARREL'}
+
 
 
             
