@@ -13,6 +13,160 @@ from dotenv import load_dotenv
 from src.models.PointPillars import PointPillarsModel, PointPillarsLoss
 from src.loaders.loader_Point_Pillars import PointPillarsLoader
 
+class AnchorGenerator:
+    """Generates anchors for PointPillars detection"""
+    
+    def __init__(self, x_range, y_range, z_range, voxel_size, anchor_sizes, target_classes, rotations=(0, np.pi/2)):
+        """
+        Args:
+            x_range: (min, max) in meters
+            y_range: (min, max) in meters
+            z_range: (min, max) in meters
+            voxel_size: (x_size, y_size) in meters
+            anchor_sizes: list of (length, width, height) for each class
+            rotations: list of rotations to apply to anchors
+        """
+        self.x_range = x_range
+        self.y_range = y_range
+        self.z_range = z_range
+        self.voxel_size = voxel_size
+        self.anchor_sizes = anchor_sizes
+        self.rotations = rotations
+        
+        # Calculate grid dimensions
+        self.nx = int((x_range[1] - x_range[0]) / voxel_size[0] / 4)  # /4 due to backbone downsampling
+        self.ny = int((y_range[1] - y_range[0]) / voxel_size[1] / 4)  # /4 due to backbone downsampling
+        
+        # Generate anchors
+        self.anchors = self._generate_anchors()
+        
+    def _generate_anchors(self):
+        """Generate anchor boxes for all positions in the feature map"""
+        anchors = []
+        x_centers = np.linspace(self.x_range[0], self.x_range[1], self.nx)
+        y_centers = np.linspace(self.y_range[0], self.y_range[1], self.ny)
+        
+        # Use mean of z_range as anchor height
+        z_center = (self.z_range[0] + self.z_range[1]) / 2
+        
+        # Generate anchors for each position
+        for x in x_centers:
+            for y in y_centers:
+                for size in self.anchor_sizes:
+                    length, width, height = size
+                    for rotation in self.rotations:
+                        anchors.append([x, y, z_center, length, width, height, rotation])
+        
+        return np.array(anchors)
+    
+    def encode_targets(self, batch_annotations):
+        """
+        Encode ground truth boxes to match anchor format
+        
+        Returns:
+            gt_boxes: tensor of shape [batch_size, num_anchors, 7]
+            gt_classes: tensor of shape [batch_size, num_anchors]
+            gt_directions: tensor of shape [batch_size, num_anchors]
+            pos_mask: tensor of shape [batch_size, num_anchors]
+        """
+        batch_size = len(batch_annotations)
+        num_anchors = len(self.anchors)
+        
+        gt_boxes = torch.zeros((batch_size, num_anchors, 7), dtype=torch.float32)
+        gt_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long)
+        gt_directions = torch.zeros((batch_size, num_anchors), dtype=torch.long)
+        pos_mask = torch.zeros((batch_size, num_anchors), dtype=torch.bool)
+        
+        # For each batch item
+        for b, annotations in enumerate(batch_annotations):
+            # Skip if no annotations
+            if annotations is None or len(annotations) == 0:
+                continue
+                
+            # Convert annotations to tensor format [N, 7] - (x, y, z, l, w, h, yaw)
+            num_gt = len(annotations)
+            gt_boxes_raw = torch.zeros((num_gt, 7), dtype=torch.float32)
+            
+            # Extract values from annotations
+            for i, anno in enumerate(annotations.iterrows()):
+                anno = anno[1]  # Get the pandas Series from the tuple
+                
+                # Get box center and dimensions
+                x, y, z = anno['tx_m'], anno['ty_m'], anno['tz_m']
+                l, w, h = anno['length_m'], anno['width_m'], anno['height_m']
+                
+                # Convert quaternion to yaw (rotation around z-axis)
+                qw, qx, qy, qz = anno['qw'], anno['qx'], anno['qy'], anno['qz']
+                yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
+                
+                # Store in tensor
+                gt_boxes_raw[i] = torch.tensor([x, y, z, l, w, h, yaw])
+                
+                # Get category ID
+                category = anno['category']
+                category_id = self._get_category_id(category) + 1  # Add 1 to skip background (0)
+                
+                # Find matching anchors (IoU > threshold)
+                # For simplicity, assign to closest anchor
+                ious = self._calculate_iou_2d(self.anchors, gt_boxes_raw[i].numpy())
+                max_iou_idx = np.argmax(ious)
+                
+                # Assign ground truth to this anchor
+                gt_boxes[b, max_iou_idx] = gt_boxes_raw[i]
+                gt_classes[b, max_iou_idx] = category_id
+                
+                # Determine direction class (0: forward, 1: backward)
+                # This is a simplified approach; you may need to adjust based on your dataset
+                gt_directions[b, max_iou_idx] = 0 if yaw > 0 else 1
+                
+                # Mark this anchor as positive
+                pos_mask[b, max_iou_idx] = True
+            
+        return gt_boxes, gt_classes, gt_directions, pos_mask
+    
+    def _calculate_iou_2d(self, anchors, gt_box):
+        """Vectorized IoU calculation between anchors and a ground truth box (2D)."""
+        anchors = np.array(anchors)
+        gt_box = np.array(gt_box)
+
+        # Anchor corners
+        x1_anchors = anchors[:, 0] - anchors[:, 3] / 2
+        y1_anchors = anchors[:, 1] - anchors[:, 4] / 2
+        x2_anchors = anchors[:, 0] + anchors[:, 3] / 2
+        y2_anchors = anchors[:, 1] + anchors[:, 4] / 2
+
+        # Ground truth box corners
+        x1_gt = gt_box[0] - gt_box[3] / 2
+        y1_gt = gt_box[1] - gt_box[4] / 2
+        x2_gt = gt_box[0] + gt_box[3] / 2
+        y2_gt = gt_box[1] + gt_box[4] / 2
+
+        # Intersection
+        x1_inter = np.maximum(x1_anchors, x1_gt)
+        y1_inter = np.maximum(y1_anchors, y1_gt)
+        x2_inter = np.minimum(x2_anchors, x2_gt)
+        y2_inter = np.minimum(y2_anchors, y2_gt)
+
+        inter_area = np.maximum(0, x2_inter - x1_inter) * np.maximum(0, y2_inter - y1_inter)
+
+        # Union
+        anchor_area = (x2_anchors - x1_anchors) * (y2_anchors - y1_anchors)
+        gt_area = (x2_gt - x1_gt) * (y2_gt - y1_gt)
+        union_area = anchor_area + gt_area - inter_area
+
+        # IoU
+        iou = inter_area / np.maximum(union_area, 1e-6)
+        return iou
+        
+    def _get_category_id(self, category):
+        """Convert category string to ID based on the full dataset classes"""
+        # Define a mapping from category names to IDs
+        categories = {}
+        for i, cat in enumerate(self.target_classes):
+            categories[cat] = i        
+
+        # Return the category ID or a default value (e.g., -1 for unknown classes)
+        return categories.get(category, -1)  # Default to -1 for unknown classes
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train PointPillars model')
