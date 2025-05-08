@@ -147,8 +147,9 @@ def main():
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
-    # Create dataset and loader
-    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    # Create dataset
+    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+    train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
     
     # Process a sample
     sample = train_dataset.samples[0]
@@ -170,3 +171,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # python -m src.utils.visualization.pillars

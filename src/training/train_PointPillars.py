@@ -16,8 +16,8 @@ from src.loaders.loader_Point_Pillars import PointPillarsLoader
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train PointPillars model')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--metrics_dir', type=str, default='outputs/metrics', help='Directory to save training metrics')
@@ -37,7 +37,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
+def get_data_loaders(val_ratio=0.2, batch_size=1, seed=42, target_classes=None):
     """Create train and validation data loaders with sklearn's train_test_split"""
     # Load environment variables
     load_dotenv()
@@ -48,7 +48,10 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
     # Create dataset
-    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    if target_classes is not None:
+        train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
+    else:
+        raise Exception("Target classes must be provided for the dataset.")
     
     # Process all samples (or a subset for faster development)
     processed_samples = train_dataset.process_all_samples(limit=16)
@@ -66,8 +69,6 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
         collate_fn=collate_fn
     )
     
@@ -75,8 +76,6 @@ def get_data_loaders(val_ratio=0.2, batch_size=4, seed=42):
         val_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
         collate_fn=collate_fn
     )
     
@@ -231,22 +230,22 @@ def main():
     train_loader, val_loader = get_data_loaders(
         val_ratio=args.val_ratio, 
         batch_size=args.batch_size,
-        seed=args.seed
+        seed=args.seed,
+        target_classes={'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
     )
 
-    for batch_idx, batch in enumerate(train_loader):
-        print("\nInspecting batch:", batch_idx)
-        print(f"Pillars shape: {batch['pillars'].shape}")
-        print(f"Coords shape: {batch['coords'].shape}")
-        print(f"Number of targets: {len(batch['targets'])}")
+    # for batch_idx, batch in enumerate(train_loader):
+    #     print("\nInspecting batch:", batch_idx)
+    #     print(f"Pillars shape: {batch['pillars'].shape}")
+    #     print(f"Coords shape: {batch['coords'].shape}")
+    #     print(f"Number of targets: {len(batch['targets'])}")
 
-    for batch_idx, batch in enumerate(val_loader):
-        print("\nInspecting validation batch:", batch_idx)
-        print(f"Pillars shape: {batch['pillars'].shape}")
-        print(f"Coords shape: {batch['coords'].shape}")
-        print(f"Number of targets: {len(batch['targets'])}")
+    # for batch_idx, batch in enumerate(val_loader):
+    #     print("\nInspecting validation batch:", batch_idx)
+    #     print(f"Pillars shape: {batch['pillars'].shape}")
+    #     print(f"Coords shape: {batch['coords'].shape}")
+    #     print(f"Number of targets: {len(batch['targets'])}")
     
-    return
     # Get number of classes from dataset
     num_classes = len(train_loader.dataset.dataset.classes) + 1  # +1 for background
     
@@ -256,7 +255,7 @@ def main():
     
     # Initialize optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
     # Training loop
     best_val_loss = float('inf')
@@ -325,3 +324,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python -m src.training.train_PointPillars

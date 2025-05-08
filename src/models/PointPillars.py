@@ -12,14 +12,17 @@ class PillarFeatureNet(nn.Module):
         self.linear = nn.Linear(in_channels, out_channels)
         self.bn = nn.BatchNorm1d(out_channels)
 
-    def forward(self, x):  # x: [P, N, 9]
-        P, N, D = x.shape
-        x = x.view(P * N, D)
+    def forward(self, x):  # x: [B, P, N, 9]
+        B, P, N, D = x.shape
+        # Reshape for linear layer
+        x = x.view(B * P * N, D)
         x = self.linear(x)
         x = self.bn(x)
         x = F.relu(x)
-        x = x.view(P, N, -1)
-        x = torch.max(x, dim=1)[0]  # [P, C]
+        # Reshape back to [B, P, N, C]
+        x = x.view(B, P, N, -1)
+        # Max pooling over points in each pillar
+        x = torch.max(x, dim=2)[0]  # [B, P, C]
         return x
 
 class PseudoImageScatter(nn.Module):
@@ -38,41 +41,47 @@ class PseudoImageScatter(nn.Module):
     def forward(self, pillar_features, coords):
         """
         Args:
-            pillar_features: Tensor of shape [num_pillars, num_features]
-            coords: Tensor of shape [num_pillars, 3] with indices (batch_idx, x_idx, y_idx)
+            pillar_features: Tensor of shape [B, P, C] with features
+            coords: Tensor of shape [B, P, 4] with indices (batch_idx, x_idx, y_idx, z_idx)
         
         Returns:
-            pseudo_image: Tensor of shape [1, num_features, H, W]
+            pseudo_image: Tensor of shape [B, C, H, W]
         """
+        B, P, C = pillar_features.shape
         H, W = self.output_shape
         
-        # Create empty pseudo-image tensor with batch_size=1
+        # Create empty pseudo-image tensor with batch_size B
         pseudo_image = torch.zeros(
-            (1, self.num_features, H, W),
+            (B, self.num_features, H, W),
             dtype=pillar_features.dtype,
             device=pillar_features.device
         )
         
-        # Only use non-empty pillars
-        if pillar_features.shape[0] > 0:
-            # Get indices from coords - assuming batch index is always 0
-            x_idx = coords[:, 2].long()  # Note: In your implementation, y is at index 2
-            y_idx = coords[:, 1].long()  # and x is at index 1 (this follows the paper's convention)
+        # Process each batch separately
+        for b in range(B):
+            batch_features = pillar_features[b]  # [P, C]
+            batch_coords = coords[b]  # [P, 4]
             
-            # Filter out invalid coordinates
-            valid_mask = (
-                (x_idx >= 0) & (x_idx < W) & 
-                (y_idx >= 0) & (y_idx < H)
-            )
-            
-            if valid_mask.any():
-                y_idx_valid = y_idx[valid_mask]
-                x_idx_valid = x_idx[valid_mask]
-                features_valid = pillar_features[valid_mask]
+            # Only use non-empty pillars (assume all are valid for now)
+            if batch_features.shape[0] > 0:
+                # Get indices from coords
+                y_idx = batch_coords[:, 1].long()  # y is at index 1
+                x_idx = batch_coords[:, 2].long()  # x is at index 2
                 
-                # Simple approach - loop through each valid pillar
-                for i in range(len(y_idx_valid)):
-                    pseudo_image[0, :, y_idx_valid[i], x_idx_valid[i]] = features_valid[i]
+                # Filter out invalid coordinates
+                valid_mask = (
+                    (x_idx >= 0) & (x_idx < W) & 
+                    (y_idx >= 0) & (y_idx < H)
+                )
+                
+                if valid_mask.any():
+                    y_idx_valid = y_idx[valid_mask]
+                    x_idx_valid = x_idx[valid_mask]
+                    features_valid = batch_features[valid_mask]
+                    
+                    # Scatter features to pseudo image
+                    for i in range(len(y_idx_valid)):
+                        pseudo_image[b, :, y_idx_valid[i], x_idx_valid[i]] = features_valid[i]
         
         return pseudo_image
 
@@ -193,14 +202,14 @@ class PointPillarsModel(nn.Module):
         self.head = SSDDetectionHead(num_classes=num_classes, in_channels=128)
         
     def forward(self, pillars, coords):
-        # Pillar feature encoding
-        pillar_features = self.pfn(pillars)  # [P, C]
+        # Pillar feature encoding - handle batched input
+        pillar_features = self.pfn(pillars)  # [B, P, C]
         
         # Scatter to pseudo image
-        pseudo_image = self.scatter(pillar_features, coords)  # [1, C, H, W]
+        pseudo_image = self.scatter(pillar_features, coords)  # [B, C, H, W]
         
         # CNN backbone
-        cnn_features = self.backbone(pseudo_image)  # [1, 128, H/4, W/4]
+        cnn_features = self.backbone(pseudo_image)  # [B, 128, H/4, W/4]
         
         # SSD head
         bbox_preds, cls_scores, dir_scores = self.head(cnn_features)
@@ -219,7 +228,8 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
     # Create dataset and loader
-    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+    train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
 
     # Create a small sample for testing
     processed_samples = train_dataset.process_all_samples(limit=3)
@@ -227,11 +237,11 @@ if __name__ == "__main__":
     pillars, coords = sample["lidar_processed"]
 
     # Convert numpy arrays to torch tensors
-    pillars_tensor = torch.from_numpy(pillars).float()
-    coords_tensor = torch.from_numpy(coords).int()
+    pillars_tensor = torch.from_numpy(pillars).float().unsqueeze(0)  # Add batch dimension
+    coords_tensor = torch.from_numpy(coords).int().unsqueeze(0)      # Add batch dimension
 
-    print(f"Input pillar shape: {pillars.shape}")
-    print(f"Coords shape: {coords.shape}")
+    print(f"Input pillar shape: {pillars_tensor.shape}")
+    print(f"Coords shape: {coords_tensor.shape}")
 
     # Initialize the model
     model = PointPillarsModel(num_classes=len(train_dataset.classes) + 1)  # +1 for background class
@@ -241,6 +251,9 @@ if __name__ == "__main__":
     print(f"Bounding box predictions shape: {bbox_preds.shape}")
     print(f"Class scores shape: {cls_scores.shape}")
     print(f"Direction scores shape: {dir_scores.shape}")
+
+
+    # python -m src.models.PointPillars
 
 
 

@@ -9,12 +9,13 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 class ArgoDataset(Dataset):
-    def __init__(self, root_dir, split='train', cameras=None, lidar=True):
+    def __init__(self, root_dir, split='train', cameras=None, lidar=True, target_classes=None):
         super().__init__()
 
         self.root_dir = root_dir
         self.split = split
         self.lidar = lidar
+        self.target_classes = target_classes
 
         # Default camera configuration
         if cameras is None:
@@ -40,6 +41,9 @@ class ArgoDataset(Dataset):
 
         self.classes = self._get_class_categories()
         print(f"Found {len(self.classes)} unique classes in the dataset.")
+        
+        if self.target_classes:
+            print(f"Using {len(self.target_classes)} target classes: {', '.join(self.target_classes)}")
 
     def _get_class_categories(self):
         classes = set()
@@ -99,6 +103,10 @@ class ArgoDataset(Dataset):
                         # Filter annotations for this timestamp
                         frame_annotations = annotations[annotations['timestamp_ns'] == timestamp]
                         
+                        # Filter annotations by target classes if specified
+                        if self.target_classes is not None:
+                            frame_annotations = frame_annotations[frame_annotations['category'].isin(self.target_classes)]
+                        
                         samples.append({
                             'sequence_path': seq_path,
                             'timestamp': timestamp,
@@ -129,10 +137,27 @@ if __name__ == "__main__":
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
-    # Create dataset and loader
-    train_dataset = ArgoDataset(dataset_path, split='train')
+    # Define target classes
+    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+
+
+    train_dataset = ArgoDataset(
+        root_dir=dataset_path, 
+        split='train', 
+        target_classes=target_classes
+    )
+    print(f"Training classes: {train_dataset.classes}")
+
+    test_dataset = ArgoDataset(
+        root_dir=dataset_path, 
+        split='test', 
+        target_classes=target_classes
+    )
+    print(f"Testing classes: {test_dataset.classes}")
+
+    # python -m src.loaders.loader
 
 
 
-            
-    
+
+

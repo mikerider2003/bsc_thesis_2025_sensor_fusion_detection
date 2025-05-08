@@ -3,21 +3,23 @@ import matplotlib.pyplot as plt
 import torch
 import os
 
-def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8)):
+def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8), batch_idx=0):
     """
     Visualizes the feature presence in a pseudo-image.
     
     Args:
-        pseudo_image (torch.Tensor): Tensor of shape [1, C, H, W] where C is number of channels
+        pseudo_image (torch.Tensor): Tensor of shape [B, C, H, W] where C is number of channels
+                                    B is batch size, H and W are height and width
         save_path (str, optional): Path to save the visualization. If None, the plot is shown.
         figsize (tuple): Figure size (width, height) in inches
+        batch_idx (int): Index of the batch item to visualize
     """
     if isinstance(pseudo_image, torch.Tensor):
         # Move to CPU if on GPU and convert to numpy
         pseudo_image = pseudo_image.detach().cpu().numpy()
     
-    # Count non-zero elements in each spatial cell
-    non_zero_mask = (pseudo_image[0] != 0).sum(axis=0) > 0
+    # Count non-zero elements in each spatial cell for the specified batch item
+    non_zero_mask = (pseudo_image[batch_idx] != 0).sum(axis=0) > 0
     
     # Create figure with appropriate size
     plt.figure(figsize=figsize)
@@ -25,7 +27,7 @@ def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8)):
     # Plot binary presence of features with enhanced visibility
     im = plt.imshow(non_zero_mask, cmap='viridis', interpolation='nearest')
     
-    plt.title('Pseudo-Image ', fontsize=16)
+    plt.title('Pseudo-Image', fontsize=16)
     plt.grid(False)
     
     # Higher DPI for better quality
@@ -44,7 +46,6 @@ def visualize_pseudo_image(pseudo_image, save_path=None, figsize=(10, 8)):
 if __name__ == "__main__":
     import os
     
-    
     from src.models.PointPillars import PillarFeatureNet, PseudoImageScatter
     from src.loaders.loader_Point_Pillars import PointPillarsLoader
     from dotenv import load_dotenv
@@ -58,16 +59,17 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
     # Create dataset and loader
-    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+    train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
     
     # Create a small sample for testing
     processed_samples = train_dataset.process_all_samples(limit=1)
     sample = processed_samples[0]
     pillars, coords = sample["lidar_processed"]
     
-    # Convert numpy arrays to torch tensors
-    pillars_tensor = torch.from_numpy(pillars).float()
-    coords_tensor = torch.from_numpy(coords).int()
+    # Convert numpy arrays to torch tensors with batch dimension
+    pillars_tensor = torch.from_numpy(pillars).float().unsqueeze(0)  # Add batch dimension
+    coords_tensor = torch.from_numpy(coords).int().unsqueeze(0)      # Add batch dimension
     
     # Calculate grid dimensions
     x_range = (-100, 100)
@@ -77,7 +79,7 @@ if __name__ == "__main__":
     nx = int(np.floor((x_range[1] - x_range[0]) / voxel_size[0]))
     ny = int(np.floor((y_range[1] - y_range[0]) / voxel_size[1]))
     
-    # Create model
+    # Create model components
     pfn = PillarFeatureNet()
     scatter = PseudoImageScatter(output_shape=(ny, nx), num_features=64)
     
@@ -85,10 +87,15 @@ if __name__ == "__main__":
     pillar_features = pfn(pillars_tensor)
     pseudo_image = scatter(pillar_features, coords_tensor)
     
-    # Visualize feature density
+    print(f"Pseudo-image shape: {pseudo_image.shape}")
+    
+    # Visualize feature density (batch_idx=0 since we only have one sample)
     visualize_pseudo_image(
         pseudo_image,
-        save_path="src/utils/visualization/figures/Figure_2_pseudo_image.png"
+        save_path="src/utils/visualization/figures/Figure_2_pseudo_image.png",
+        batch_idx=0
     )
     
     print("Visualization complete. Check the figures directory for results.")
+
+    # python -m src.utils.visualization.PsuedoImageScatter

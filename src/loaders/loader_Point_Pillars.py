@@ -7,8 +7,8 @@ import pyarrow.feather as feather
 from tqdm import tqdm
 
 class PointPillarsLoader(loader.ArgoDataset):
-    def __init__(self, dataset_path, split='train', cameras=None, lidar=True):
-        super().__init__(dataset_path, split, cameras, lidar)
+    def __init__(self, dataset_path, split='train', cameras=None, lidar=True, target_classes=None):
+        super().__init__(dataset_path, split, cameras, lidar, target_classes)
 
     def _process_lidar(self, lidar_file, 
                        batch_index=None, 
@@ -175,8 +175,10 @@ if __name__ == "__main__":
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
+    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+
     # Create dataset and loader
-    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
     
     # TODO: REMOVE limit
     processed_samples = train_dataset.process_all_samples(limit=5)
@@ -198,7 +200,6 @@ if __name__ == "__main__":
         print(f"Batch {processed_sample['batch_index']}: {non_empty_count} non-empty pillars, ratio: {ratio:.2f}, avg num of points per pillar: {avg_points:.2f}")
 
 
-
     # Sample format:
     # {
     #     'sequence_path': seq_path,
@@ -208,3 +209,5 @@ if __name__ == "__main__":
     #     'annotations': frame_annotations
     #     'lidar_processed': (pillars, coords)
     # }
+
+    # python -m src.loaders.loader_Point_Pillars
