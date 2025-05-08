@@ -24,6 +24,7 @@ class AnchorGenerator:
             z_range: (min, max) in meters
             voxel_size: (x_size, y_size) in meters
             anchor_sizes: list of (length, width, height) for each class
+            target_classes: set of target class names
             rotations: list of rotations to apply to anchors
         """
         self.x_range = x_range
@@ -31,6 +32,7 @@ class AnchorGenerator:
         self.z_range = z_range
         self.voxel_size = voxel_size
         self.anchor_sizes = anchor_sizes
+        self.target_classes = target_classes
         self.rotations = rotations
         
         # Calculate grid dimensions
@@ -287,6 +289,19 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     
+    # Initialize AnchorGenerator 
+    anchor_generator = AnchorGenerator(
+        x_range=(-100, 100),
+        y_range=(-100, 100),
+        z_range=(-3, 1),
+        voxel_size=(0.3, 0.3),
+        anchor_sizes=[(4.5, 2.0, 1.7),  # Car
+                    (0.8, 0.8, 1.7),  # Pedestrian
+                    (8.0, 2.5, 3.0),  # Truck/Large Vehicle
+                    ],
+        target_classes=train_loader.dataset.dataset.classes
+    )
+    
     progress_bar = tqdm(train_loader, desc="Training")
     for batch_idx, batch in enumerate(progress_bar):
         # Get data
@@ -297,27 +312,62 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         # Forward pass
         bbox_preds, cls_scores, dir_scores = model(pillars, coords)
         
-        # TODO: Convert targets to expected format for loss calculation
-        # This depends on how you've structured your targets and loss function
-        pred_boxes = ...  # Extract from model outputs
-        gt_boxes = ...  # Extract from targets
-        pred_cls = ...
-        gt_cls = ...
-        pred_dir = ...
-        gt_dir = ...
-        pos_mask = ...  # Positive anchor mask
+        # Convert targets to expected format for loss calculation
+        gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
+        
+        # Move targets to device
+        gt_boxes = gt_boxes.to(device)
+        gt_cls = gt_cls.to(device)
+        gt_dir = gt_dir.to(device)
+        pos_mask = pos_mask.to(device)
+        
+        # Get predictions in proper format for loss calculation
+        # Reshape 4D outputs to 3D tensors [B, H*W, C]
+        B = bbox_preds.shape[0]
+        num_classes = cls_scores.shape[1]
+        
+        # Reshape bbox_preds: [B, num_classes*7, H, W] -> [B, H*W, 7]
+        bbox_preds = bbox_preds.view(B, num_classes, 7, -1)  # [B, num_classes, 7, H*W]
+        bbox_preds = bbox_preds.permute(0, 3, 1, 2)  # [B, H*W, num_classes, 7]
+        bbox_preds = bbox_preds.reshape(-1, 7)  # [B*H*W*num_classes, 7]
+        
+        # Reshape cls_scores: [B, num_classes, H, W] -> [B, H*W, num_classes]
+        H, W = cls_scores.shape[2], cls_scores.shape[3]
+        cls_scores = cls_scores.permute(0, 2, 3, 1)  # [B, H, W, num_classes]
+        cls_scores = cls_scores.reshape(-1, num_classes)  # [B*H*W, num_classes]
+        
+        # Reshape dir_scores: [B, 2, H, W] -> [B, H*W, 2]
+        dir_scores = dir_scores.permute(0, 2, 3, 1)  # [B, H, W, 2]
+        dir_scores = dir_scores.reshape(-1, 2)  # [B*H*W, 2]
+        
+        # Flatten targets
+        gt_boxes = gt_boxes.reshape(-1, 7)
+        gt_cls = gt_cls.reshape(-1)
+        gt_dir = gt_dir.reshape(-1)
+        pos_mask = pos_mask.reshape(-1)
         
         # Calculate loss
-        loss = criterion(pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask)
+        total_batch_loss, loc_loss, cls_loss, dir_loss = criterion(
+            pred_boxes=bbox_preds, 
+            gt_boxes=gt_boxes, 
+            pred_cls=cls_scores, 
+            gt_cls=gt_cls, 
+            pred_dir=dir_scores, 
+            gt_dir=gt_dir, 
+            pos_mask=pos_mask
+        )
         
         # Backward pass and optimize
         optimizer.zero_grad()
-        loss.backward()
+        total_batch_loss.backward()
         optimizer.step()
         
         # Update progress
-        total_loss += loss.item()
-        progress_bar.set_postfix({"batch_loss": loss.item()})
+        total_loss += total_batch_loss.item()
+        progress_bar.set_postfix({"batch_loss": total_batch_loss.item(), 
+                                "loc_loss": loc_loss.item(),
+                                "cls_loss": cls_loss.item(),
+                                "dir_loss": dir_loss.item()})
     
     return total_loss / len(train_loader)
 
@@ -326,6 +376,19 @@ def validate(model, val_loader, criterion, device):
     """Validate the model"""
     model.eval()
     total_loss = 0
+    
+    # Initialize AnchorGenerator - same settings as in train_one_epoch
+    anchor_generator = AnchorGenerator(
+        x_range=(-100, 100),
+        y_range=(-100, 100),
+        z_range=(-3, 1),
+        voxel_size=(0.3, 0.3),
+        anchor_sizes=[(4.5, 2.0, 1.7),  # Car
+                    (0.8, 0.8, 1.7),  # Pedestrian
+                    (8.0, 2.5, 3.0),  # Truck/Large Vehicle
+                    ],
+        target_classes=val_loader.dataset.dataset.classes
+    )
     
     progress_bar = tqdm(val_loader, desc="Validation")
     with torch.no_grad():
@@ -338,22 +401,57 @@ def validate(model, val_loader, criterion, device):
             # Forward pass
             bbox_preds, cls_scores, dir_scores = model(pillars, coords)
             
-            # TODO: Convert targets to expected format for loss calculation
-            # Similar to the training function
-            pred_boxes = ...
-            gt_boxes = ...
-            pred_cls = ...
-            gt_cls = ...
-            pred_dir = ...
-            gt_dir = ...
-            pos_mask = ...
+            # Convert targets to expected format for loss calculation
+            gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
+            
+            # Move targets to device
+            gt_boxes = gt_boxes.to(device)
+            gt_cls = gt_cls.to(device)
+            gt_dir = gt_dir.to(device)
+            pos_mask = pos_mask.to(device)
+            
+            # Get predictions in proper format for loss calculation
+            # Reshape 4D outputs to 3D tensors [B, H*W, C]
+            B = bbox_preds.shape[0]
+            num_classes = cls_scores.shape[1]
+            
+            # Reshape bbox_preds: [B, num_classes*7, H, W] -> [B, H*W, 7]
+            bbox_preds = bbox_preds.view(B, num_classes, 7, -1)  # [B, num_classes, 7, H*W]
+            bbox_preds = bbox_preds.permute(0, 3, 1, 2)  # [B, H*W, num_classes, 7]
+            bbox_preds = bbox_preds.reshape(-1, 7)  # [B*H*W*num_classes, 7]
+            
+            # Reshape cls_scores: [B, num_classes, H, W] -> [B, H*W, num_classes]
+            H, W = cls_scores.shape[2], cls_scores.shape[3]
+            cls_scores = cls_scores.permute(0, 2, 3, 1)  # [B, H, W, num_classes]
+            cls_scores = cls_scores.reshape(-1, num_classes)  # [B*H*W, num_classes]
+            
+            # Reshape dir_scores: [B, 2, H, W] -> [B, H*W, 2]
+            dir_scores = dir_scores.permute(0, 2, 3, 1)  # [B, H, W, 2]
+            dir_scores = dir_scores.reshape(-1, 2)  # [B*H*W, 2]
+            
+            # Flatten targets
+            gt_boxes = gt_boxes.reshape(-1, 7)
+            gt_cls = gt_cls.reshape(-1)
+            gt_dir = gt_dir.reshape(-1)
+            pos_mask = pos_mask.reshape(-1)
             
             # Calculate loss
-            loss = criterion(pred_boxes, gt_boxes, pred_cls, gt_cls, pred_dir, gt_dir, pos_mask)
+            total_batch_loss, loc_loss, cls_loss, dir_loss = criterion(
+                pred_boxes=bbox_preds, 
+                gt_boxes=gt_boxes, 
+                pred_cls=cls_scores, 
+                gt_cls=gt_cls, 
+                pred_dir=dir_scores, 
+                gt_dir=gt_dir, 
+                pos_mask=pos_mask
+            )
             
             # Update progress
-            total_loss += loss.item()
-            progress_bar.set_postfix({"batch_loss": loss.item()})
+            total_loss += total_batch_loss.item()
+            progress_bar.set_postfix({"batch_loss": total_batch_loss.item(),
+                                    "loc_loss": loc_loss.item(),
+                                    "cls_loss": cls_loss.item(),
+                                    "dir_loss": dir_loss.item()})
     
     return total_loss / len(val_loader)
 

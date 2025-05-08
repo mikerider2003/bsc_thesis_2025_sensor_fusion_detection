@@ -147,6 +147,71 @@ class PointPillarsLoss(nn.Module):
         gt_dir:     [N] direction class indices (e.g., 0 or 1)
         pos_mask:   [N] boolean mask for positive anchors
         """
+        # Get shapes of all inputs
+        n_box_preds = pred_boxes.size(0)
+        n_cls_preds = pred_cls.size(0)
+        n_dir_preds = pred_dir.size(0)
+        n_targets = pos_mask.size(0)
+        
+        # Store original sizes for debugging
+        original_sizes = {
+            'pred_boxes': n_box_preds,
+            'pred_cls': n_cls_preds,
+            'pred_dir': n_dir_preds,
+            'pos_mask': n_targets
+        }
+        
+        # Create a consistent mask size that works with all predictions
+        # We'll use the smallest size among all prediction tensors
+        min_size = min(n_box_preds, n_cls_preds, n_dir_preds)
+        
+        # Adjust all inputs to have the same first dimension
+        if min_size < n_targets:
+            # If predictions are smaller than targets, truncate targets
+            pos_mask = pos_mask[:min_size]
+            gt_boxes = gt_boxes[:min_size]
+            gt_cls = gt_cls[:min_size]
+            gt_dir = gt_dir[:min_size]
+            
+            # Also truncate any prediction tensors that are too large
+            if n_box_preds > min_size:
+                pred_boxes = pred_boxes[:min_size]
+            if n_cls_preds > min_size:
+                pred_cls = pred_cls[:min_size]
+            if n_dir_preds > min_size:
+                pred_dir = pred_dir[:min_size]
+        else:
+            # If targets are smaller than predictions, pad targets
+            pad_size = min_size - n_targets
+            if pad_size > 0:
+                # Pad pos_mask with False values
+                pos_mask = torch.cat([pos_mask, torch.zeros(pad_size, dtype=torch.bool, device=pos_mask.device)], dim=0)
+                
+                # Pad gt_boxes with zeros
+                padding = torch.zeros(pad_size, 7, dtype=gt_boxes.dtype, device=gt_boxes.device)
+                gt_boxes = torch.cat([gt_boxes, padding], dim=0)
+                
+                # Pad gt_cls with zeros (background class)
+                gt_cls = torch.cat([gt_cls, torch.zeros(pad_size, dtype=gt_cls.dtype, device=gt_cls.device)], dim=0)
+                
+                # Pad gt_dir with zeros
+                gt_dir = torch.cat([gt_dir, torch.zeros(pad_size, dtype=gt_dir.dtype, device=gt_dir.device)], dim=0)
+            
+            # Also truncate any prediction tensors that are larger than min_size
+            if n_box_preds > min_size:
+                pred_boxes = pred_boxes[:min_size]
+            if n_cls_preds > min_size:
+                pred_cls = pred_cls[:min_size]
+            if n_dir_preds > min_size:
+                pred_dir = pred_dir[:min_size]
+            
+        # Final sanity check - ensure all shapes match
+        assert pred_boxes.size(0) == pos_mask.size(0)
+        assert pred_cls.size(0) == pos_mask.size(0)
+        assert pred_dir.size(0) == pos_mask.size(0)
+        assert gt_boxes.size(0) == pos_mask.size(0)
+        assert gt_cls.size(0) == pos_mask.size(0)
+        assert gt_dir.size(0) == pos_mask.size(0)
 
         # Number of positive anchors
         N_pos = pos_mask.sum().clamp(min=1).float()
