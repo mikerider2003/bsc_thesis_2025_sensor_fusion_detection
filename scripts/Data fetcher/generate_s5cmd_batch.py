@@ -5,7 +5,7 @@ import os
 # Set the random seed for reproducibility
 random.seed(42)
 
-def sample_and_split_commands(list_path, dataset_name, output_path, percentage=0.05, train_ratio=0.8):
+def sample_and_split_commands(list_path, dataset_name, output_path, percentage=0.01, train_ratio=0.8):
     with open(list_path, 'r') as f:
         sequence_dirs = [line.strip().replace("DIR  ", "").strip() for line in f if line.strip()]
     
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         'train.txt', 
         'train', 
         'download_5percent.s5cmd', 
-        percentage=0.05,
+        percentage=0.02,
         train_ratio=0.8
     )
     
