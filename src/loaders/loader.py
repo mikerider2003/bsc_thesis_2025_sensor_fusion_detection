@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 class ArgoDataset(Dataset):
-    def __init__(self, root_dir, split='train', cameras=None, lidar=True, target_classes=None):
+    def __init__(self, root_dir, split='train', cameras=None, lidar=True, target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}):
         super().__init__()
 
         self.root_dir = root_dir
@@ -42,8 +42,6 @@ class ArgoDataset(Dataset):
         self.classes = self._get_class_categories()
         print(f"Found {len(self.classes)} unique classes in the dataset.")
         
-        if self.target_classes:
-            print(f"Using {len(self.target_classes)} target classes: {', '.join(self.target_classes)}")
 
     def _get_class_categories(self):
         classes = set()
@@ -147,6 +145,8 @@ if __name__ == "__main__":
         target_classes=target_classes
     )
     print(f"Training classes: {train_dataset.classes}")
+    sample = train_dataset[0]
+    print(f"Sample: {sample}")
 
     test_dataset = ArgoDataset(
         root_dir=dataset_path, 
@@ -155,7 +155,16 @@ if __name__ == "__main__":
     )
     print(f"Testing classes: {test_dataset.classes}")
 
-    # python -m src.loaders.loader
+# Sample format:
+# {
+#     'sequence_path': seq_path,
+#     'timestamp': timestamp,
+#     'lidar_file': os.path.join(lidar_dir, f"{timestamp}.feather"),
+#     'camera_frames': camera_frames,
+#     'annotations': frame_annotations
+# }
+
+# python -m src.loaders.loader
 
 
 
