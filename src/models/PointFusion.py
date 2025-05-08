@@ -97,8 +97,8 @@ class PointFusionLoss(nn.Module):
     def __init__(self, matcher):
         super().__init__()
         self.matcher = matcher
-        self.box_loss = nn.SmoothL1Loss(reduction='none')
-        self.cls_loss = nn.CrossEntropyLoss(reduction='none')
+        self.box_loss = nn.SmoothL1Loss(reduction='mean')  # Changed to mean reduction
+        self.cls_loss = nn.CrossEntropyLoss(reduction='mean')  # Changed to mean reduction
         
     def forward(self, outputs, targets):
         indices = self.matcher(outputs, targets)
@@ -113,8 +113,8 @@ class PointFusionLoss(nn.Module):
             pred_corners = outputs['corners'][batch_idx, pred_indices]
             pred_logits = outputs['class_logits'][batch_idx, pred_indices]
             
-            # Calculate losses
-            box_loss = self.box_loss(pred_corners, tgt_corners).mean()
+            # Calculate losses with proper reduction
+            box_loss = self.box_loss(pred_corners, tgt_corners)
             cls_loss = self.cls_loss(pred_logits, targets[batch_idx]['labels'][tgt_indices])
             
             total_loss += box_loss + cls_loss
