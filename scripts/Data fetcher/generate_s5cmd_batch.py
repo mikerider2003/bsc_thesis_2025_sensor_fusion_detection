@@ -38,7 +38,7 @@ if __name__ == "__main__":
         'train.txt', 
         'train', 
         'download_5percent.s5cmd', 
-        percentage=0.05,
+        percentage=0.01,
         train_ratio=0.8
     )
     

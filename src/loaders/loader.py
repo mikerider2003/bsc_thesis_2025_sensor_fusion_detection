@@ -64,8 +64,6 @@ class ArgoDataset(Dataset):
                 if os.path.isdir(os.path.join(split_dir, d))
             ])
             sequences = [os.path.join(split_dir, d) for d in sequence_folders]
-        # TODO: REMOVE THIS
-        return list(sequences[0:1])
         return sequences
     
     def _load_samples_from_sequences(self):
