@@ -19,7 +19,7 @@ def main():
     
     # Initialize model and loss
     model = PointFusion3D(max_predictions=max_predictions).to(device)
-    matcher = HungarianMatcher(cost_class=1, cost_bbox=5)
+    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_heading=2)  # New
     criterion = PointFusionLoss(matcher).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
@@ -29,9 +29,9 @@ def main():
     data_path = os.getenv('DATA_PATH', default='src/data/')
     full_dataset = PointFusionloader(data_path, split='train')
     
-    # TODO: Temporary subset for development
-    indices = list(range(100))  # Remove this for full training
-    full_dataset = Subset(full_dataset, indices)
+    # # TODO: Temporary subset for development
+    # indices = list(range(100))  # Remove this for full training
+    # full_dataset = Subset(full_dataset, indices)
     
     # Split dataset
     train_indices, val_indices = train_test_split(
@@ -43,8 +43,8 @@ def main():
     val_set = Subset(full_dataset, val_indices)
 
     # Create dataloaders
-    train_loader = DataLoader(train_set, batch_size=4, shuffle=True, collate_fn=custom_collate)
-    val_loader = DataLoader(val_set, batch_size=4, shuffle=False, collate_fn=custom_collate)
+    train_loader = DataLoader(train_set, batch_size=8, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_set, batch_size=8, shuffle=False, collate_fn=custom_collate)
 
     # Training loop
     best_val_loss = float('inf')

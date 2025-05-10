@@ -20,12 +20,12 @@ class ArgoDataset(Dataset):
         # Default camera configuration
         if cameras is None:
             self.cameras = [
-                'ring_front_center', 
-                'ring_front_left',
-                'ring_front_right',
                 'ring_rear_left',
-                'ring_rear_right',
                 'ring_side_left',
+                'ring_front_left',
+                'ring_front_center', 
+                'ring_front_right',
+                'ring_rear_right',
                 'ring_side_right'
             ]
         else:
