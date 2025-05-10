@@ -66,9 +66,9 @@ class FusionNetwork(nn.Module):
         }
 
 class HungarianMatcher(nn.Module):
-    """Matches predictions using parameter distances"""
-    def __init__(self, cost_class=1, cost_bbox=5, cost_heading=2):
+    def __init__(self, cost_class=1, cost_bbox=5, cost_heading=1):
         super().__init__()
+        # Adjusted default weights
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_heading = cost_heading
@@ -79,33 +79,33 @@ class HungarianMatcher(nn.Module):
         indices = []
         
         for b in range(batch_size):
-            # Get predictions and targets
             pred_params = outputs['params'][b]  # [K, 7]
             tgt_params = targets[b]['boxes']    # [M, 7]
             tgt_labels = targets[b]['labels']   # [M]
-            
-            # Position cost (x,y,z) - pairwise [K, M]
+
+            # Position cost [K, M]
             pos_cost = torch.cdist(pred_params[:, :3], tgt_params[:, :3])
             
-            # Dimension cost (l,w,h) - pairwise [K, M]
+            # Dimension cost [K, M]
             dim_cost = torch.cdist(pred_params[:, 3:6], tgt_params[:, 3:6])
             
-            # Heading cost - pairwise [K, M]
-            pred_heading = pred_params[:, 6].unsqueeze(1)  # [K, 1]
-            tgt_heading = tgt_params[:, 6].unsqueeze(0)    # [1, M]
+            # Heading cost [K, M]
+            pred_heading = pred_params[:, 6].unsqueeze(1)
+            tgt_heading = tgt_params[:, 6].unsqueeze(0)
             heading_diff = torch.abs(pred_heading - tgt_heading)
             heading_cost = torch.min(heading_diff, 2*np.pi - heading_diff)
             
-            # Class cost - pairwise [K, M]
-            pred_logits = outputs['class_logits'][b].softmax(-1)  # [K, 4]
-            class_cost = -pred_logits[:, tgt_labels]  # [K, M]
+            # FIXED Class cost: Positive error term [K, M]
+            pred_probs = outputs['class_logits'][b].softmax(-1)
+            class_cost = 1 - pred_probs[:, tgt_labels]  # 0 = perfect, 1 = worst
             
-            # Total cost [K, M]
-            C = (self.cost_bbox * (pos_cost + dim_cost) + 
-                 self.cost_heading * heading_cost +
-                 self.cost_class * class_cost)
+            # Balanced total cost [K, M]
+            C = (
+                self.cost_bbox * (pos_cost + 0.5*dim_cost) +
+                self.cost_heading * heading_cost +
+                self.cost_class * class_cost
+            )
             
-            # Hungarian matching
             indices.append(linear_sum_assignment(C.cpu()))
             
         return indices
