@@ -50,18 +50,23 @@ class FusionNetwork(nn.Module):
             nn.Linear(2048, 1024), nn.ReLU(),
             nn.Linear(1024, 512), nn.ReLU())
         
-        # Prediction heads
-        self.param_head = nn.Linear(512, 7*max_predictions)  # Direct parameters
+        # Prediction heads with activation constraints
+        self.param_head = nn.Linear(512, 7*max_predictions)
         self.score_head = nn.Linear(512, max_predictions)
         self.class_head = nn.Linear(512, 4*max_predictions)
 
     def forward(self, img_feats, point_feats):
-        fused = torch.cat([img_feats, point_feats], 1)
-        fused = self.fusion_mlp(fused)
+        fused = self.fusion_mlp(torch.cat([img_feats, point_feats], 1))
+        raw_params = self.param_head(fused).view(-1, self.max_pred, 7)
+        
+        # Apply physical constraints
+        params = torch.clone(raw_params)
+        params[..., 3:6] = torch.sigmoid(raw_params[..., 3:6]) * 10  # Dimensions 0-10m
+        params[..., 6] = torch.remainder(raw_params[..., 6], 2 * np.pi)  # Heading 0-2π
         
         return {
-            'params': self.param_head(fused).view(-1, self.max_pred, 7),
-            'scores': self.score_head(fused),
+            'params': params,
+            'scores': torch.sigmoid(self.score_head(fused)),  # Confidence 0-1
             'class_logits': self.class_head(fused).view(-1, self.max_pred, 4)
         }
 
