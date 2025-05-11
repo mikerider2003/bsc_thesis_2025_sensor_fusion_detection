@@ -13,8 +13,8 @@ from src.models.PointFusion import PointFusion3D, PointFusionLoss, HungarianMatc
 def main():
     # Configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_epochs = 10
-    lr = 1e-4
+    num_epochs = 100
+    lr = 1e-5
     max_predictions = 128  # Should match your dataset's maximum annotations + buffer
     
     # Initialize model and loss
