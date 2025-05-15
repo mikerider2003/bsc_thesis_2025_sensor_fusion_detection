@@ -224,21 +224,22 @@ if __name__ == "__main__":
     dataset_path = os.getenv('DATA_PATH', default='src/data/')
 
     train_set = PointFusionloader(dataset_path, split='train')
+    test_set = PointFusionloader(dataset_path, split='test')
 
-    # Inspect the first sample
-    sample = train_set[0]
+    # # Inspect the first sample
+    # sample = train_set[0]
 
-    points = sample['points']
-    images = sample['images']
-    annotations = sample['annotations']
+    # points = sample['points']
+    # images = sample['images']
+    # annotations = sample['annotations']
 
-    print(f"Points shape: {points.shape}")
-    for camera_name, image in images.items():
-        print(f"Image {camera_name} shape: {image.shape}")
+    # print(f"Points shape: {points.shape}")
+    # for camera_name, image in images.items():
+    #     print(f"Image {camera_name} shape: {image.shape}")
     
-    print(f"Annotations: \n\tBoxes shape: {annotations['boxes'].shape},\n\tLabels shape: {annotations['labels'].shape}")
+    # print(f"Annotations: \n\tBoxes shape: {annotations['boxes'].shape},\n\tLabels shape: {annotations['labels'].shape}")
 
-    plot_scene(points, annotations)
+    # plot_scene(points, annotations)
     # plot_images(images)
         
 

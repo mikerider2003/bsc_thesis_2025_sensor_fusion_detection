@@ -14,7 +14,7 @@
 
 
 ## Introduction
-This project compares single-modal and multi-modal object detection methods for autonomous driving using the Argoverse2 dataset. It evaluates how well LiDAR-only, and fused sensor approaches (via early, mid, and late fusion strategies) detect objects like vehicles and pedestrians in diverse urban conditions. By using models such as PointPillars for LiDAR and fusion methods like PointFusion, MVX-Net, and AVOD, the study aims to quantify differences in accuracy, robustness, and inference speed, offering insights into effective sensor fusion strategies for safer autonomous systems.
+This project compares single-modal and multi-modal object detection methods for autonomous driving using the Argoverse2 dataset. It evaluates how well LiDAR-only, and fused sensor approaches (via early and late fusion strategies) detect objects like vehicles and pedestrians in diverse urban conditions. By using models such as PointPillars for LiDAR and fusion methods like PointFusion and AVOD, the study aims to quantify differences in accuracy, robustness, and inference speed, offering insights into effective sensor fusion strategies for safer autonomous systems.
 
 ## Dataset
 The Argoverse2 sensor dataset is a large-scale dataset designed for autonomous driving research. It includes high-resolution sensor data from various modalities, including LiDAR and cameras, collected in diverse urban environments.
@@ -134,7 +134,25 @@ python -m src.utils.visualization.pillars
 
 ### Multi-Modal
 #### PointFusion (Early Fusion)
+PLAN:
 
-#### MVX-Net (Mid Fusion)
+Sample from my data:
+Points shape: (45000, 3)
+Image ring_rear_left shape: torch.Size([3, 388, 512])
+Image ring_side_left shape: torch.Size([3, 388, 512])
+Image ring_front_left shape: torch.Size([3, 388, 512])
+Image ring_front_center shape: torch.Size([3, 388, 512])
+Image ring_front_right shape: torch.Size([3, 388, 512])
+Image ring_rear_right shape: torch.Size([3, 388, 512])
+Image ring_side_right shape: torch.Size([3, 388, 512])
+Annotations_3d: 
+        Boxes shape: torch.Size([64, 7]),
+        Labels shape: torch.Size([64])
+
+- **Early Fusion**: Combines LiDAR and camera data at the feature level before feeding it into the neural network.
+- **Feature Extraction**: Extracts features from both LiDAR and camera data.
+- **Fusion Layer**: Merges the features from both modalities.
+- **Detection Head**: Processes the fused features to predict bounding boxes and class scores.
+- **Loss Function**: Combines classification and regression losses for training.
 
 #### AVOD (Late Fusion)

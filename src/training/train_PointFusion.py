@@ -19,7 +19,7 @@ def main():
     
     # Initialize model and loss
     model = PointFusion3D(max_predictions=max_predictions).to(device)
-    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_heading=2)  # New
+    matcher = HungarianMatcher()
     criterion = PointFusionLoss(matcher).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
