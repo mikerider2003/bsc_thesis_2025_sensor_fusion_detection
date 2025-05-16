@@ -9,7 +9,6 @@
         - [PointPillars (LiDAR Only)](#pointpillars-lidar-only)
     - [Multi-Modal](#multi-modal)
         - [PointFusion (Early Fusion)](#pointfusion-early-fusion)
-        - [MVX-Net (Mid Fusion)](#mvx-net-mid-fusion)
         - [AVOD (Late Fusion)](#avod-late-fusion)
 
 
@@ -21,7 +20,7 @@ The Argoverse2 sensor dataset is a large-scale dataset designed for autonomous d
 
 [Argoverse 2 Link](https://www.argoverse.org/av2.html)
 
-Due to the size of the original dataset (1TB), this study will use a subset of the Argoverse2 dataset, specifically 5% of the data (41,2 GB), which is split into 28 training sequences and 7 test sequences.
+Due to the size of the original dataset (1TB), this study will use a subset of the Argoverse2 dataset, specifically 1% of the data (8,05 GB), which is split into 5 training sequences and 2 test sequences.
 
 To download the dataset, you can use the following command:
 
@@ -68,12 +67,13 @@ chmod +x ./scripts/download_data.sh
 ```
 
 ### Pre-processing
-The dataset is pre-processed to extract relevant features and annotations for training and evaluation. The pre-processing steps include:
-
+The dataset is pre-processed to extract relevant features and annotations for training and evaluation. 
 
 ## Methodology
 ### Single-Modal:
 #### PointPillars (LiDAR Only)
+Due to unforeseen delays arising from extensive debugging, the model is still under development and may be subject to further modifications.
+
 PointPillars is a state of the art LiDAR-based object detection model that uses a unique pillar-based representation of point clouds. 
 
 ##### Pre-processing
@@ -126,28 +126,10 @@ The features for each point include:
 - `/src/models/PointPillars.py`: Will contain the model architecture implementation (currently empty, to be implemented)
 - `/scripts/run_train_pointpillars.sh`: Will be used for training the PointPillars model (currently empty, to be implemented)
 
-##### Usage:
-```bash
-python -m src.loaders.loader_Point_Pillars
-python -m src.utils.visualization.pillars
-```
 
 ### Multi-Modal
 #### PointFusion (Early Fusion)
-PLAN:
-
-Sample from my data:
-Points shape: (45000, 3)
-Image ring_rear_left shape: torch.Size([3, 388, 512])
-Image ring_side_left shape: torch.Size([3, 388, 512])
-Image ring_front_left shape: torch.Size([3, 388, 512])
-Image ring_front_center shape: torch.Size([3, 388, 512])
-Image ring_front_right shape: torch.Size([3, 388, 512])
-Image ring_rear_right shape: torch.Size([3, 388, 512])
-Image ring_side_right shape: torch.Size([3, 388, 512])
-Annotations_3d: 
-        Boxes shape: torch.Size([64, 7]),
-        Labels shape: torch.Size([64])
+Due to unforeseen delays arising from extensive debugging, the model is still under development and may be subject to further modifications.
 
 - **Early Fusion**: Combines LiDAR and camera data at the feature level before feeding it into the neural network.
 - **Feature Extraction**: Extracts features from both LiDAR and camera data.
@@ -155,4 +137,7 @@ Annotations_3d:
 - **Detection Head**: Processes the fused features to predict bounding boxes and class scores.
 - **Loss Function**: Combines classification and regression losses for training.
 
+
+
 #### AVOD (Late Fusion)
+Due to unforeseen delays caused by extensive debugging of the preceding two models, the implementation of this model is still pending.
