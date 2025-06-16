@@ -3,283 +3,403 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import math
 
-from src.loaders.loader_Point_Pillars import PointPillarsLoader
+from src.loaders.loader_Point_Pillars import PointPillarsLoader, collate_fn
 
 class PillarFeatureNet(nn.Module):
-    def __init__(self, in_channels=9, out_channels=64):
-        super(PillarFeatureNet, self).__init__()
-        self.linear = nn.Linear(in_channels, out_channels)
-        self.bn = nn.BatchNorm1d(out_channels)
+    def __init__(self, num_input_features: int = 9, num_output_features: int = 64):
+        """
+        Pillar Feature Network (PFN).
+        Transforms raw point features within each pillar into a pillar-level feature representation.
 
-    def forward(self, x):  # x: [B, P, N, 9]
-        B, P, N, D = x.shape
-        # Reshape for linear layer
-        x = x.view(B * P * N, D)
-        x = self.linear(x)
-        x = self.bn(x)
-        x = F.relu(x)
-        # Reshape back to [B, P, N, C]
-        x = x.view(B, P, N, -1)
-        # Max pooling over points in each pillar
-        x = torch.max(x, dim=2)[0]  # [B, P, C]
-        return x
+        Args:
+            num_input_features (int): Number of features for each point within a pillar.
+                                      Typically 9 for PointPillars (x,y,z,r, xc,yc,zc, xp,yp).
+                                      This corresponds to F in the input shape (∑P, N, F).
+            num_output_features (int): Dimensionality of the learned pillar features.
+        """
+        super().__init__()
+        self.num_output_features = num_output_features
+        self.num_input_features = num_input_features
 
-class PseudoImageScatter(nn.Module):
-    def __init__(self, output_shape, num_features=64):
+        # Simplified PointNet-like structure: Linear -> BatchNorm -> ReLU
+        self.fc = nn.Linear(self.num_input_features, self.num_output_features, bias=False)
+        self.norm = nn.BatchNorm1d(self.num_output_features, eps=1e-3, momentum=0.01)
+
+    def forward(self, pillar_features: torch.Tensor) -> torch.Tensor:
         """
-        Scatter pillar features to a 2D pseudo-image
-        
+        Forward pass of the PillarFeatureNet.
+
         Args:
-            output_shape: Tuple (H, W) defining the output pseudo-image dimensions
-            num_features: Number of features per pillar
-        """
-        super(PseudoImageScatter, self).__init__()
-        self.output_shape = output_shape
-        self.num_features = num_features
-        
-    def forward(self, pillar_features, coords):
-        """
-        Args:
-            pillar_features: Tensor of shape [B, P, C] with features
-            coords: Tensor of shape [B, P, 4] with indices (batch_idx, x_idx, y_idx, z_idx)
-        
+            pillar_features (torch.Tensor): Tensor of point features for each pillar.
+                Shape: (P, N, D_in), where:
+                    P = total number of non-empty pillars in the batch (∑P).
+                    N = maximum number of points per pillar.
+                    D_in = num_input_features (F, features per point).
+
         Returns:
-            pseudo_image: Tensor of shape [B, C, H, W]
+            torch.Tensor: Learned feature representation for each pillar.
+                Shape: (P, D_out), where D_out = num_output_features.
         """
-        B, P, C = pillar_features.shape
-        H, W = self.output_shape
-        
-        # Create empty pseudo-image tensor with batch_size B
-        pseudo_image = torch.zeros(
-            (B, self.num_features, H, W),
-            dtype=pillar_features.dtype,
-            device=pillar_features.device
+        P, N, D_in = pillar_features.shape
+        if D_in != self.num_input_features:
+            raise ValueError(
+                f"Input feature dimension ({D_in}) does not match "
+                f"PillarFeatureNet's num_input_features ({self.num_input_features})"
+            )
+
+        # Reshape for applying linear layer to all points: (P * N, D_in)
+        x = pillar_features.view(P * N, D_in)
+
+        # Apply Linear -> BatchNorm -> ReLU
+        x = self.fc(x)
+        x = self.norm(x)
+        x = F.relu(x)
+
+        x = x.view(P, N, self.num_output_features)
+
+        # mask_shape: (P, N). True for valid points, False for padded points.
+        # Padded points are those points (x,y,z) == 0
+        is_padded_point = torch.all(pillar_features[:, :, :3] == 0, dim=2)
+        mask = ~is_padded_point # True for valid points, shape (P, N)
+
+        x_masked = torch.where(
+            mask.unsqueeze(-1),  
+            x,                   
+            torch.tensor(float('-inf'), device=x.device, dtype=x.dtype) 
         )
-        
-        # Process each batch separately
-        for b in range(B):
-            batch_features = pillar_features[b]  # [P, C]
-            batch_coords = coords[b]  # [P, 4]
-            
-            # Only use non-empty pillars (assume all are valid for now)
-            if batch_features.shape[0] > 0:
-                # Get indices from coords
-                y_idx = batch_coords[:, 1].long()  # y is at index 1
-                x_idx = batch_coords[:, 2].long()  # x is at index 2
-                
-                # Filter out invalid coordinates
-                valid_mask = (
-                    (x_idx >= 0) & (x_idx < W) & 
-                    (y_idx >= 0) & (y_idx < H)
-                )
-                
-                if valid_mask.any():
-                    y_idx_valid = y_idx[valid_mask]
-                    x_idx_valid = x_idx[valid_mask]
-                    features_valid = batch_features[valid_mask]
-                    
-                    # Scatter features to pseudo image
-                    for i in range(len(y_idx_valid)):
-                        pseudo_image[b, :, y_idx_valid[i], x_idx_valid[i]] = features_valid[i]
-        
-        return pseudo_image
 
-class CNN_BackBone(nn.Module):
+        # Max pooling over the N (points per pillar) dimension
+        encoded_pillars = torch.max(x_masked, dim=1).values
+
+        return encoded_pillars
+
+
+class PsuedoScatter(nn.Module):
+    def __init__(self, num_input_features: int, grid_size_xy: tuple[int, int]):
+        """
+        Pillar Scatter operation.
+        Scatters learned pillar features into a 2D pseudo-image.
+
+        Args:
+            num_input_features (int): Number of features for each encoded pillar.
+                                      This is D_out from PillarFeatureNet.
+            grid_size_xy (tuple[int, int]): The H, W dimensions of the 2D pseudo-image.
+                                            (e.g., (grid_height, grid_width))
+        """
+        super().__init__()
+        self.num_input_features = num_input_features
+        self.grid_height = grid_size_xy[0]
+        self.grid_width = grid_size_xy[1]
+
+    def forward(self, encoded_pillars: torch.Tensor, pillar_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the PillarScatter.
+
+        Args:
+            encoded_pillars (torch.Tensor): Learned pillar features from PFN.
+                                            Shape: (P, D_out), where P is the total number
+                                            of pillars in the batch.
+            pillar_coords (torch.Tensor): Coordinates for each pillar.
+                                          Shape: (P, 3)
+                                          Expected format: (x_idx, y_idx, batch_idx).
+                                          Ensure y_idx and x_idx are within grid_height and grid_width.
+
+        Returns:
+            torch.Tensor: Batched 2D pseudo-image.
+                          Shape: (B, D_out, grid_height, grid_width), where B is batch size.
+        """
+        batch_size = int(torch.max(pillar_coords[:, 2]).item() + 1)
+        
+        # Initialize an empty canvas for the pseudo-image
+        # Shape: (B, D_out, H, W)
+        canvas = torch.zeros(
+            batch_size,
+            self.num_input_features,
+            self.grid_height,
+            self.grid_width,
+            dtype=encoded_pillars.dtype,
+            device=encoded_pillars.device
+        )
+
+        # Scatter pillar features onto the canvas
+        y_indices = pillar_coords[:, 0].long()
+        x_indices = pillar_coords[:, 1].long()
+        batch_indices = pillar_coords[:, 2].long()
+
+        # Ensure indices are within bounds (optional, but good practice if not guaranteed by preprocessing)
+        y_indices = torch.clamp(y_indices, 0, self.grid_height - 1)
+        x_indices = torch.clamp(x_indices, 0, self.grid_width - 1)
+        
+        canvas[batch_indices, :, y_indices, x_indices] = encoded_pillars
+        
+        return canvas
+
+def visualize_pseudo_image(canvas: torch.Tensor, title: str = "Pseudo Image"):
+    """
+    Visualizes the 2D pseudo-image for all batch samples as subplots.
+
+    Args:
+        canvas (torch.Tensor): The pseudo-image tensor to visualize.
+                               Shape: (B, D_out, H, W).
+        title (str): Title for the plot.
+    """
+    if canvas.is_cuda:
+        canvas = canvas.cpu()
+    canvas = canvas.detach()
+
+    B, D_out, H, W = canvas.shape
+
+    # Calculate subplot grid size
+    ncols = min(B, 4)
+    nrows = math.ceil(B / ncols)
+
+    fig, axs = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    axs = axs.flatten() if B > 1 else [axs]
+
+    for b in range(B):
+        img = canvas[b].sum(dim=0)
+        ax = axs[b]
+        im = ax.imshow(img, cmap='viridis')
+        ax.set_xlabel("X (grid width)")
+        ax.set_ylabel("Y (grid height)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Hide any unused subplots
+    for i in range(B, len(axs)):
+        axs[i].axis('off')
+
+    plt.suptitle(f'{title} (Batch size = {B})', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+class Backbone(nn.Module):
     def __init__(self, in_channels=64):
-        super(CNN_BackBone, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        super().__init__()
+        # Example backbone: 3 convolutional blocks
+        self.block1 = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.pool(x)
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        return x
+        # x: [B, C, H, W]
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        return x  # [B, 256, H/8, W/8]
 
-# SSD Detection Head for predicting bounding boxes
-class SSDDetectionHead(nn.Module):
-    def __init__(self, num_classes, in_channels=128):
-        super(SSDDetectionHead, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(256)
-
-        # For each class, predict 7 values: (x, y, z, length, width, height, θ)
-        self.conv2 = nn.Conv2d(256, num_classes * 7, kernel_size=3, padding=1)
-        
-        # Class prediction
-        self.conv3 = nn.Conv2d(256, num_classes, kernel_size=3, padding=1)
-        
-        # Direction prediction (binary: forward/backward)
-        self.conv_dir = nn.Conv2d(256, 2, kernel_size=3, padding=1)
+class DetectionHead(nn.Module):
+    def __init__(self, in_channels=256, num_classes=3, box_code_size=9):
+        """
+        Args:
+            in_channels (int): Number of channels from the backbone output.
+            num_classes (int): Number of object classes (excluding background).
+            box_code_size (int): Number of box regression parameters (default 9: cx, cy, cz, l, w, h, qw, qx, qy).
+        """
+        super().__init__()
+        self.box_head = nn.Conv2d(in_channels, box_code_size, kernel_size=1)
+        self.cls_head = nn.Conv2d(in_channels, num_classes, kernel_size=1)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        bbox_regression = self.conv2(x)
-        class_scores = self.conv3(x)
-        direction_scores = self.conv_dir(x)
-        return bbox_regression, class_scores, direction_scores
-
-class PointPillarsLoss(nn.Module):
-    def __init__(self, beta_loc=2.0, beta_cls=1.0, beta_dir=0.2,
-                 alpha=0.25, gamma=2.0):
-        super(PointPillarsLoss, self).__init__()
-        self.beta_loc = beta_loc
-        self.beta_cls = beta_cls
-        self.beta_dir = beta_dir
-        self.alpha = alpha
-        self.gamma = gamma
-        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none')  # for direction classification
-
-    def forward(self, pred_boxes, gt_boxes, pred_cls, gt_cls,
-                pred_dir, gt_dir, pos_mask):
         """
-        pred_boxes: [N, 7] predicted box residuals (x, y, z, w, l, h, θ)
-        gt_boxes:   [N, 7] ground truth residuals
-        pred_cls:   [N, C] class probabilities (after sigmoid or softmax)
-        gt_cls:     [N] ground truth class indices (0 = background)
-        pred_dir:   [N, 2] direction class logits
-        gt_dir:     [N] direction class indices (e.g., 0 or 1)
-        pos_mask:   [N] boolean mask for positive anchors
+        Args:
+            x (torch.Tensor): Backbone feature map, shape [B, in_channels, H, W]
+        Returns:
+            box_preds (torch.Tensor): [B, box_code_size, H, W]
+            cls_preds (torch.Tensor): [B, num_classes, H, W]
         """
-        # Get shapes of all inputs
-        n_box_preds = pred_boxes.size(0)
-        n_cls_preds = pred_cls.size(0)
-        n_dir_preds = pred_dir.size(0)
-        n_targets = pos_mask.size(0)
+        box_preds = self.box_head(x)
+        cls_preds = self.cls_head(x)
+        return box_preds, cls_preds
+
+class Anchor():
+    def __init__(self, grid_size, grid_resolution=0.2, anchor_sizes=None, anchor_rotations=None):
+        """
+        Initialize the Anchor object.
+        Args:
+            grid_size (tuple): Size of the grid in cells (height, width)
+            grid_resolution (float): Meters per grid cell (default: 0.2m)
+            anchor_sizes (dict): Anchor dimensions for each class in meters (l, w, h)
+            anchor_rotations (list): Anchor rotations in degrees
+        """
+        self.grid_size = grid_size
+        self.grid_resolution = grid_resolution  # meters per grid cell
+
+        if anchor_sizes is None:
+            self.anchor_sizes = {
+                'PEDESTRIAN':      (0.8, 0.6, 1.7),
+                'TRUCK':           (12.0, 2.5, 3.5),
+                'LARGE_VEHICLE':   (8.0, 2.8, 3.0),
+                'REGULAR_VEHICLE': (4.0, 1.8, 1.6),
+            } 
+        else:
+            self.anchor_sizes = anchor_sizes
+
+        if anchor_rotations is None:
+            self.anchor_rotations = [i for i in range(0, 180, 30)]
+            self.anchor_rotations = [0, 90]
+        else:
+            self.anchor_rotations = anchor_rotations
         
-        # Store original sizes for debugging
-        original_sizes = {
-            'pred_boxes': n_box_preds,
-            'pred_cls': n_cls_preds,
-            'pred_dir': n_dir_preds,
-            'pos_mask': n_targets
+        self.anchors, self.anchor_classes = self.generate()
+
+    def generate(self):
+        """
+        Generate anchors for the entire BEV grid.
+        Returns:
+            anchors (torch.Tensor): [num_anchors, 10] (cx, cy, cz, l, w, h, qw, qx, qy, qz)
+            anchor_classes (list): List of class names for each anchor
+        """
+        H, W = self.grid_size
+        anchors = []
+        anchor_classes = []
+        
+        # Convert grid centers to meters (0.2m per cell)
+        x_centers = (torch.arange(W, dtype=torch.float32) + 0.5) * self.grid_resolution
+        y_centers = (torch.arange(H, dtype=torch.float32) + 0.5) * self.grid_resolution
+
+        for class_name, (l, w, h) in self.anchor_sizes.items():
+            cz = h 
+            for rot_deg in self.anchor_rotations:
+                # Convert rotation to radians and compute quaternion
+                rot_rad = torch.deg2rad(torch.tensor(rot_deg, dtype=torch.float32))
+                qw = torch.cos(rot_rad / 2)
+                qz = torch.sin(rot_rad / 2)  # Rotation around Z-axis (yaw)
+                
+                # Create grid for centers
+                grid_y, grid_x = torch.meshgrid(y_centers, x_centers, indexing='ij')
+                num_anchors = grid_x.numel()
+                
+                # Create anchor tensor block: [H*W, 10]
+                block_anchors = torch.zeros((num_anchors, 10), dtype=torch.float32)
+                
+                # Fill anchor components
+                block_anchors[:, 0] = grid_x.reshape(-1)  # cx (meters)
+                block_anchors[:, 1] = grid_y.reshape(-1)  # cy (meters)
+                block_anchors[:, 2] = cz                  # cz (meters)
+                block_anchors[:, 3] = l                   # length (meters)
+                block_anchors[:, 4] = w                   # width (meters)
+                block_anchors[:, 5] = h                   # height (meters)
+                block_anchors[:, 6] = qw                  # qw
+                block_anchors[:, 7] = 0.0                 # qx (always 0 for BEV)
+                block_anchors[:, 8] = 0.0                 # qy (always 0 for BEV)
+                block_anchors[:, 9] = qz                  # qz
+                
+                anchors.append(block_anchors)
+                anchor_classes.extend([class_name] * num_anchors)
+        
+        anchors = torch.cat(anchors, dim=0)
+        return anchors, anchor_classes
+    
+    def plot_anchors(self, sample_stride=50, max_anchors=500):
+        """
+        Plot a sample of generated anchors in Bird's Eye View (BEV).
+        
+        Args:
+            sample_stride (int): Stride for sampling anchors to plot
+            max_anchors (int): Maximum number of anchors to display
+        """
+
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import numpy as np
+        from matplotlib.collections import PatchCollection
+
+        anchors, anchor_classes = self.generate()
+
+        # Convert to numpy for easier handling
+        anchors = anchors.numpy()
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 10))
+        ax.set_title('Anchor Boxes - Bird\'s Eye View')
+        ax.set_xlabel('X (meters)')
+        ax.set_ylabel('Y (meters)')
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.set_aspect('equal')
+        
+        # Determine plot limits
+        max_extent = max(np.max(anchors[:, 3]), np.max(anchors[:, 4])) * 1.2
+        cx_min, cx_max = np.min(anchors[:, 0]), np.max(anchors[:, 0])
+        cy_min, cy_max = np.min(anchors[:, 1]), np.max(anchors[:, 1])
+        
+        ax.set_xlim(cx_min - max_extent, cx_max + max_extent)
+        ax.set_ylim(cy_min - max_extent, cy_max + max_extent)
+        
+        # Create color mapping for classes
+        class_colors = {
+            'PEDESTRIAN': 'red',
+            'TRUCK': 'blue',
+            'LARGE_VEHICLE': 'green',
+            'REGULAR_VEHICLE': 'purple'
         }
         
-        # Create a consistent mask size that works with all predictions
-        # We'll use the smallest size among all prediction tensors
-        min_size = min(n_box_preds, n_cls_preds, n_dir_preds)
+        # Create legend handles
+        legend_handles = []
+        for cls, color in class_colors.items():
+            legend_handles.append(patches.Patch(color=color, label=cls))
         
-        # Adjust all inputs to have the same first dimension
-        if min_size < n_targets:
-            # If predictions are smaller than targets, truncate targets
-            pos_mask = pos_mask[:min_size]
-            gt_boxes = gt_boxes[:min_size]
-            gt_cls = gt_cls[:min_size]
-            gt_dir = gt_dir[:min_size]
+        # Create patches for anchors
+        all_patches = []
+        
+        # Sample anchors to plot
+        num_anchors = anchors.shape[0]
+        sample_indices = range(0, num_anchors, sample_stride)
+        if len(sample_indices) > max_anchors:
+            sample_indices = np.random.choice(num_anchors, max_anchors, replace=False)
+        
+        for idx in sample_indices:
+            cx, cy, cz, l, w, h, qw, qx, qy, qz = anchors[idx]
+            class_name = anchor_classes[idx]
             
-            # Also truncate any prediction tensors that are too large
-            if n_box_preds > min_size:
-                pred_boxes = pred_boxes[:min_size]
-            if n_cls_preds > min_size:
-                pred_cls = pred_cls[:min_size]
-            if n_dir_preds > min_size:
-                pred_dir = pred_dir[:min_size]
-        else:
-            # If targets are smaller than predictions, pad targets
-            pad_size = min_size - n_targets
-            if pad_size > 0:
-                # Pad pos_mask with False values
-                pos_mask = torch.cat([pos_mask, torch.zeros(pad_size, dtype=torch.bool, device=pos_mask.device)], dim=0)
-                
-                # Pad gt_boxes with zeros
-                padding = torch.zeros(pad_size, 7, dtype=gt_boxes.dtype, device=gt_boxes.device)
-                gt_boxes = torch.cat([gt_boxes, padding], dim=0)
-                
-                # Pad gt_cls with zeros (background class)
-                gt_cls = torch.cat([gt_cls, torch.zeros(pad_size, dtype=gt_cls.dtype, device=gt_cls.device)], dim=0)
-                
-                # Pad gt_dir with zeros
-                gt_dir = torch.cat([gt_dir, torch.zeros(pad_size, dtype=gt_dir.dtype, device=gt_dir.device)], dim=0)
+            # Calculate yaw angle from quaternion
+            yaw = 2 * np.arctan2(qz, qw)
             
-            # Also truncate any prediction tensors that are larger than min_size
-            if n_box_preds > min_size:
-                pred_boxes = pred_boxes[:min_size]
-            if n_cls_preds > min_size:
-                pred_cls = pred_cls[:min_size]
-            if n_dir_preds > min_size:
-                pred_dir = pred_dir[:min_size]
+            # Create rectangle patch
+            rect = patches.Rectangle(
+                (cx - l/2, cy - w/2),  # bottom left corner
+                l, w,                   # length and width
+                angle=np.degrees(yaw),   # rotation in degrees
+                color=class_colors.get(class_name, 'gray'),
+                alpha=0.4
+            )
+            all_patches.append(rect)
             
-        # Final sanity check - ensure all shapes match
-        assert pred_boxes.size(0) == pos_mask.size(0)
-        assert pred_cls.size(0) == pos_mask.size(0)
-        assert pred_dir.size(0) == pos_mask.size(0)
-        assert gt_boxes.size(0) == pos_mask.size(0)
-        assert gt_cls.size(0) == pos_mask.size(0)
-        assert gt_dir.size(0) == pos_mask.size(0)
-
-        # Number of positive anchors
-        N_pos = pos_mask.sum().clamp(min=1).float()
-
-        # ----- Localization Loss -----
-        loc_loss = self.smooth_l1(pred_boxes[pos_mask], gt_boxes[pos_mask])
-        loc_loss = loc_loss.sum() / N_pos
-
-        # ----- Direction Classification Loss -----
-        dir_loss = self.ce_loss(pred_dir[pos_mask], gt_dir[pos_mask])
-        dir_loss = dir_loss.sum() / N_pos
-
-        # ----- Classification Loss (Focal Loss) -----
-        cls_loss = self.focal_loss(pred_cls, gt_cls)
-        cls_loss = cls_loss.sum() / N_pos
-
-        # ----- Total Loss -----
-        total_loss = (self.beta_loc * loc_loss +
-                      self.beta_cls * cls_loss +
-                      self.beta_dir * dir_loss)
-
-        return total_loss, loc_loss, cls_loss, dir_loss
-
-    def focal_loss(self, inputs, targets):
-        """
-        Focal loss for classification.
-        inputs: [N, C] logits (before softmax or sigmoid)
-        targets: [N] ground truth class indices
-        """
-        num_classes = inputs.size(1)
-        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
-
-        probs = F.softmax(inputs, dim=1)
-        pt = probs * targets_one_hot
-        pt = pt.sum(dim=1)  # [N]
-
-        log_pt = torch.log(pt + 1e-6)
-        focal = -self.alpha * (1 - pt) ** self.gamma * log_pt
-        return focal
-
-class PointPillarsModel(nn.Module):
-    def __init__(self, num_classes, voxel_size=(0.3, 0.3), x_range=(-100, 100), y_range=(-100, 100)):
-        super(PointPillarsModel, self).__init__()
+            # Add center point
+            ax.plot(cx, cy, 'o', markersize=2, color=class_colors.get(class_name, 'gray'))
         
-        # Calculate grid dimensions
-        self.nx = int(np.floor((x_range[1] - x_range[0]) / voxel_size[0]))
-        self.ny = int(np.floor((y_range[1] - y_range[0]) / voxel_size[1]))
+        # Add all patches to the plot
+        collection = PatchCollection(all_patches, match_original=True)
+        ax.add_collection(collection)
         
-        # Model components
-        self.pfn = PillarFeatureNet(in_channels=9, out_channels=64)
-        self.scatter = PseudoImageScatter(output_shape=(self.ny, self.nx), num_features=64)
-        self.backbone = CNN_BackBone(in_channels=64)
-        self.head = SSDDetectionHead(num_classes=num_classes, in_channels=128)
+        # Add legend
+        ax.legend(handles=legend_handles, loc='upper right')
         
-    def forward(self, pillars, coords):
-        # Pillar feature encoding - handle batched input
-        pillar_features = self.pfn(pillars)  # [B, P, C]
+        # Add grid information to title
+        H, W = self.grid_size
+        plt.title(f"Anchor Boxes (Grid: {H}x{W} cells, {self.grid_resolution}m/cell)\n"
+                  f"Showing {len(all_patches)} of {num_anchors} anchors")
         
-        # Scatter to pseudo image
-        pseudo_image = self.scatter(pillar_features, coords)  # [B, C, H, W]
+        plt.tight_layout()
+        plt.show()
         
-        # CNN backbone
-        cnn_features = self.backbone(pseudo_image)  # [B, 128, H/4, W/4]
-        
-        # SSD head
-        bbox_preds, cls_scores, dir_scores = self.head(cnn_features)
-        
-        return bbox_preds, cls_scores, dir_scores
+    def assign(self, annotations_df):
+        pass
+    
 
 # For testing/debugging
 if __name__ == "__main__":
@@ -293,30 +413,52 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
     # Create dataset and loader
-    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
-    train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
+    train_dataset = PointPillarsLoader(dataset_path, split='train')
 
-    # Create a small sample for testing
-    processed_samples = train_dataset.process_all_samples(limit=3)
-    sample = processed_samples[0]
-    pillars, coords = sample["lidar_processed"]
+    data_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=4,  # Adjust batch size as needed
+        shuffle=True,
+        collate_fn=collate_fn
+    )
 
-    # Convert numpy arrays to torch tensors
-    pillars_tensor = torch.from_numpy(pillars).float().unsqueeze(0)  # Add batch dimension
-    coords_tensor = torch.from_numpy(coords).int().unsqueeze(0)      # Add batch dimension
+    print("\n=== Testing Model Components ===")
 
-    print(f"Input pillar shape: {pillars_tensor.shape}")
-    print(f"Coords shape: {coords_tensor.shape}")
+    sample = next(iter(data_loader))
+    grid_size = (sample['grid_dims'][0], sample['grid_dims'][1])
+    
+    # Test Pillar Feature Network
+    pfn = PillarFeatureNet(num_input_features=9, num_output_features=64)
+    pillar_features = sample['features']  
+    learned_features = pfn(pillar_features)
+    print(f"PillarFeatureNet output shape: {learned_features.shape}")
 
-    # Initialize the model
-    model = PointPillarsModel(num_classes=len(train_dataset.classes) + 1)  # +1 for background class
+    # Test PsuedoScatter
+    scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
+    canvas = scatter(learned_features, sample['pillar_coords'])
+    print(f"PsuedoScatter output shape: {canvas.shape}")
+    visualize_pseudo_image(canvas)
 
-    # Forward pass
-    bbox_preds, cls_scores, dir_scores = model(pillars_tensor, coords_tensor)
-    print(f"Bounding box predictions shape: {bbox_preds.shape}")
-    print(f"Class scores shape: {cls_scores.shape}")
-    print(f"Direction scores shape: {dir_scores.shape}")
+    # Test backbone
+    backbone = Backbone()
+    backbone_output = backbone(canvas)
+    print(f"PointPillarsBackbone output shape: {backbone_output.shape}")
 
+    # Test detection head
+    detection_head = DetectionHead(in_channels=256, num_classes=train_dataset.num_classes, box_code_size=9)
+    box_preds, cls_preds = detection_head(backbone_output)
+    print(f"DetectionHead box_preds shape: {box_preds.shape}, cls_preds shape: {cls_preds.shape}")
+
+    # Test Anchor
+    anchor = Anchor(grid_size=grid_size)
+    achors, anchor_classes = anchor.generate()
+    anchor.plot_anchors()
+    print(f"Generated {len(achors)} anchors with classes: {len(anchor_classes)}")
+
+
+
+    # small_anchor = Anchor(grid_size=(2, 2))
+    # small_anchor.plot_anchors()  
 
     # python -m src.models.PointPillars
 

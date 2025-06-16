@@ -9,27 +9,24 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 class ArgoDataset(Dataset):
-    def __init__(self, root_dir, split='train', cameras=None, lidar=True, target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}):
+    def __init__(self, root_dir, split='train', target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}):
         super().__init__()
 
         self.root_dir = root_dir
         self.split = split
-        self.lidar = lidar
         self.target_classes = target_classes
 
         # Default camera configuration
-        if cameras is None:
-            self.cameras = [
-                'ring_rear_left',
-                'ring_side_left',
-                'ring_front_left',
-                'ring_front_center', 
-                'ring_front_right',
-                'ring_rear_right',
-                'ring_side_right'
-            ]
-        else:
-            self.cameras = cameras
+
+        self.cameras = [
+            'ring_rear_left',
+            'ring_side_left',
+            'ring_front_left',
+            'ring_front_center', 
+            'ring_front_right',
+            'ring_rear_right',
+            'ring_side_right'
+        ]
     
         # Find all sequences
         self.sequences = self._get_sequence()
@@ -71,7 +68,6 @@ class ArgoDataset(Dataset):
     def _load_samples_from_sequences(self):
         """Load all samples from the dataset sequences."""
         samples = []
-        batch_index = -1
         for seq_path in tqdm(self.sequences, desc="Loading sequences", ncols=100):
             # Load annotations
             anno_path = os.path.join(seq_path, 'annotations.feather')
@@ -85,7 +81,6 @@ class ArgoDataset(Dataset):
                     
                     for lidar_file in lidar_files:
                         timestamp = int(lidar_file.split('.')[0])
-                        batch_index += 1
                         
                         # Check if corresponding camera images exist
                         camera_frames = {}
@@ -108,7 +103,6 @@ class ArgoDataset(Dataset):
                         samples.append({
                             'sequence_path': seq_path,
                             'timestamp': timestamp,
-                            'batch_index': batch_index,
                             'lidar_file': os.path.join(lidar_dir, f"{timestamp}.feather"),
                             'camera_frames': camera_frames,
                             'annotations': frame_annotations
@@ -135,14 +129,9 @@ if __name__ == "__main__":
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
-    # Define target classes
-    target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
-
-
     train_dataset = ArgoDataset(
         root_dir=dataset_path, 
-        split='train', 
-        target_classes=target_classes
+        split='train'
     )
     print(f"Training classes: {train_dataset.classes}")
     sample = train_dataset[0]
@@ -150,8 +139,7 @@ if __name__ == "__main__":
 
     test_dataset = ArgoDataset(
         root_dir=dataset_path, 
-        split='test', 
-        target_classes=target_classes
+        split='test'
     )
     print(f"Testing classes: {test_dataset.classes}")
 
