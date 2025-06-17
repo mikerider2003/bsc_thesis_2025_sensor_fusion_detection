@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import math
+import torchvision.ops as tv_ops
 
 from src.loaders.loader_Point_Pillars import PointPillarsLoader, collate_fn
 
@@ -242,9 +243,9 @@ class Anchor():
         if anchor_sizes is None:
             self.anchor_sizes = {
                 'PEDESTRIAN':      (0.8, 0.6, 1.7),
-                'TRUCK':           (12.0, 2.5, 3.5),
+                'TRUCK':           (15.0, 3.0, 3.5),
                 'LARGE_VEHICLE':   (8.0, 2.8, 3.0),
-                'REGULAR_VEHICLE': (4.0, 1.8, 1.6),
+                'REGULAR_VEHICLE': (4.5, 1.8, 1.6),
             } 
         else:
             self.anchor_sizes = anchor_sizes
@@ -273,7 +274,7 @@ class Anchor():
         y_centers = (torch.arange(H, dtype=torch.float32) + 0.5) * self.grid_resolution
 
         for class_name, (l, w, h) in self.anchor_sizes.items():
-            cz = h 
+            cz = h / 2
             for rot_deg in self.anchor_rotations:
                 # Convert rotation to radians and compute quaternion
                 rot_rad = torch.deg2rad(torch.tensor(rot_deg, dtype=torch.float32))
@@ -305,26 +306,15 @@ class Anchor():
         anchors = torch.cat(anchors, dim=0)
         return anchors, anchor_classes
     
-    def plot_anchors(self, sample_stride=50, max_anchors=500):
-        """
-        Plot a sample of generated anchors in Bird's Eye View (BEV).
-        
-        Args:
-            sample_stride (int): Stride for sampling anchors to plot
-            max_anchors (int): Maximum number of anchors to display
-        """
-
+    def plot_anchors(self, sample_stride=50, max_anchors=100):
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
+        import matplotlib.transforms as mtrans
         import numpy as np
-        from matplotlib.collections import PatchCollection
 
-        anchors, anchor_classes = self.generate()
-
-        # Convert to numpy for easier handling
+        anchors, anchor_classes = self.anchors, self.anchor_classes
         anchors = anchors.numpy()
         
-        # Create figure
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.set_title('Anchor Boxes - Bird\'s Eye View')
         ax.set_xlabel('X (meters)')
@@ -332,15 +322,17 @@ class Anchor():
         ax.grid(True, linestyle='--', alpha=0.7)
         ax.set_aspect('equal')
         
-        # Determine plot limits
-        max_extent = max(np.max(anchors[:, 3]), np.max(anchors[:, 4])) * 1.2
+        # Calculate plot limits based on anchor positions
         cx_min, cx_max = np.min(anchors[:, 0]), np.max(anchors[:, 0])
         cy_min, cy_max = np.min(anchors[:, 1]), np.max(anchors[:, 1])
         
-        ax.set_xlim(cx_min - max_extent, cx_max + max_extent)
-        ax.set_ylim(cy_min - max_extent, cy_max + max_extent)
+        # Add margin based on largest anchor dimension
+        max_dim = max(np.max(anchors[:, 3]), np.max(anchors[:, 4]))
+        margin = max_dim * 1.5;
         
-        # Create color mapping for classes
+        ax.set_xlim(cx_min - margin, cx_max + margin)
+        ax.set_ylim(cy_min - margin, cy_max + margin)
+        
         class_colors = {
             'PEDESTRIAN': 'red',
             'TRUCK': 'blue',
@@ -348,20 +340,22 @@ class Anchor():
             'REGULAR_VEHICLE': 'purple'
         }
         
-        # Create legend handles
         legend_handles = []
         for cls, color in class_colors.items():
             legend_handles.append(patches.Patch(color=color, label=cls))
         
-        # Create patches for anchors
-        all_patches = []
-        
-        # Sample anchors to plot
         num_anchors = anchors.shape[0]
         sample_indices = range(0, num_anchors, sample_stride)
         if len(sample_indices) > max_anchors:
             sample_indices = np.random.choice(num_anchors, max_anchors, replace=False)
         
+        # Plot center points first
+        for idx in sample_indices:
+            cx, cy, cz, l, w, h, qw, qx, qy, qz = anchors[idx]
+            class_name = anchor_classes[idx]
+            ax.plot(cx, cy, 'o', markersize=2, color=class_colors.get(class_name, 'gray'))
+        
+        # Then add rectangles
         for idx in sample_indices:
             cx, cy, cz, l, w, h, qw, qx, qy, qz = anchors[idx]
             class_name = anchor_classes[idx]
@@ -369,37 +363,263 @@ class Anchor():
             # Calculate yaw angle from quaternion
             yaw = 2 * np.arctan2(qz, qw)
             
-            # Create rectangle patch
+            # Create transformation for rotation around CENTER
+            t = mtrans.Affine2D().rotate_around(cx, cy, yaw) + ax.transData
+            
+            # Create rectangle
             rect = patches.Rectangle(
-                (cx - l/2, cy - w/2),  # bottom left corner
-                l, w,                   # length and width
-                angle=np.degrees(yaw),   # rotation in degrees
+                (cx - l/2, cy - w/2),  # Bottom-left corner
+                l, w,                   # Length and width
+                transform=t,            # Apply center-based rotation
                 color=class_colors.get(class_name, 'gray'),
                 alpha=0.4
             )
-            all_patches.append(rect)
-            
-            # Add center point
-            ax.plot(cx, cy, 'o', markersize=2, color=class_colors.get(class_name, 'gray'))
+            ax.add_patch(rect)  # Add directly to axes
         
-        # Add all patches to the plot
-        collection = PatchCollection(all_patches, match_original=True)
-        ax.add_collection(collection)
-        
-        # Add legend
         ax.legend(handles=legend_handles, loc='upper right')
         
-        # Add grid information to title
         H, W = self.grid_size
         plt.title(f"Anchor Boxes (Grid: {H}x{W} cells, {self.grid_resolution}m/cell)\n"
-                  f"Showing {len(all_patches)} of {num_anchors} anchors")
+                f"Showing {len(sample_indices)} of {num_anchors} anchors")
         
         plt.tight_layout()
         plt.show()
         
-    def assign(self, annotations_df):
-        pass
+    def assign(self, annotations):
+        """
+        Assigns ground truth annotations to anchors using 3D IoU matching.
+        Returns matched indices for each batch separately.
+        
+        Args:
+            annotations (Dict): 
+                'boxes': Tensor of shape (N, 11) - [cx,cy,cz,l,w,h,qw,qx,qy,qz,batch_idx]
+                'categories': List of class names for each box
+        
+        Returns:
+            Dict: Dictionary with batch indices as keys and tuples (matched_gt_indices, matched_gt_boxes) as values
+                matched_gt_indices: (num_anchors,) index of matched GT (-1 = background)
+                matched_gt_boxes: (num_anchors, 10) matched GT boxes
+        """
+        boxes = annotations['boxes']
+        class_names = annotations['categories']
+        
+        num_anchors = self.anchors.shape[0]
+        batch_indices = boxes[:, 10].unique()
+        
+        batch_results = {}
+        
+        for batch_idx in batch_indices:
+            # Initialize for current batch
+            matched_gt_indices = torch.full((num_anchors,), -1, dtype=torch.long)
+            matched_gt_boxes = torch.zeros((num_anchors, 10), dtype=torch.float32)
+            
+            # Filter boxes for current batch
+            batch_mask = boxes[:, 10] == batch_idx
+            gt_boxes = boxes[batch_mask, :10]
+            
+            # Skip if no GT boxes in this batch
+            if gt_boxes.shape[0] == 0:
+                batch_results[int(batch_idx.item())] = (matched_gt_indices, matched_gt_boxes)
+                continue
+            
+            # Use 2D IoU instead of 3D
+            iou_matrix = self.calculate_2d_iou(gt_boxes)  # (num_anchors, num_gt)
+            
+            # 1. Assign best anchor for each GT
+            best_anchor_per_gt = iou_matrix.argmax(dim=0)
+            best_iou_per_gt = iou_matrix.max(dim=0).values
+            
+            for gt_idx, (anchor_idx, iou) in enumerate(zip(best_anchor_per_gt, best_iou_per_gt)):
+                if iou > 0.05:  # Minimum IoU threshold
+                    matched_gt_indices[anchor_idx] = gt_idx
+                    matched_gt_boxes[anchor_idx] = gt_boxes[gt_idx]
+            
+            # 2. Assign high IoU anchors
+            max_iou_per_anchor, best_gt_per_anchor = iou_matrix.max(dim=1)
+            high_iou_mask = (max_iou_per_anchor > 0.75) & (matched_gt_indices == -1)
+            
+            matched_gt_indices[high_iou_mask] = best_gt_per_anchor[high_iou_mask]
+            matched_gt_boxes[high_iou_mask] = gt_boxes[best_gt_per_anchor[high_iou_mask]]
+            
+            # 3. Mark low IoU anchors as background
+            low_iou_mask = max_iou_per_anchor < 0.45
+            matched_gt_indices[low_iou_mask] = -1  # Background
+            
+            # Store results for this batch
+            batch_results[int(batch_idx.item())] = (matched_gt_indices, matched_gt_boxes)
+
+            num_of_gt_boxes = gt_boxes.shape[0]
+            num_of_matched_anchors = (matched_gt_indices >= 0).sum().item()
+            # print(f'Out of {num_of_gt_boxes} GT boxes, {num_of_matched_anchors} anchors matched in batch.')
+        
+        return batch_results
     
+    def calculate_2d_iou(self, gt_boxes):
+        """
+        Calculate 2D IoU between anchors and ground truth boxes.
+        Works with batched operations for efficiency.
+        
+        Args:
+            gt_boxes (torch.Tensor): GT boxes of shape (N, 10) - [cx,cy,cz,l,w,h,qw,qx,qy,qz]
+        
+        Returns:
+            torch.Tensor: IoU matrix of shape (num_anchors, N)
+        """
+        num_anchors = self.anchors.shape[0]
+        num_gt = gt_boxes.shape[0]
+        
+        # Convert anchors and GT boxes to [x1, y1, x2, y2] format for IoU calculation
+        anchor_boxes = torch.zeros((num_anchors, 4), device=gt_boxes.device)
+        gt_boxes_2d = torch.zeros((num_gt, 4), device=gt_boxes.device)
+        
+        # For anchors: [cx, cy, l, w] -> [x1, y1, x2, y2]
+        anchor_boxes[:, 0] = self.anchors[:, 0] - self.anchors[:, 3] / 2  # x1 = cx - l/2
+        anchor_boxes[:, 1] = self.anchors[:, 1] - self.anchors[:, 4] / 2  # y1 = cy - w/2
+        anchor_boxes[:, 2] = self.anchors[:, 0] + self.anchors[:, 3] / 2  # x2 = cx + l/2
+        anchor_boxes[:, 3] = self.anchors[:, 1] + self.anchors[:, 4] / 2  # y2 = cy + w/2
+        
+        # For GT boxes: [cx, cy, l, w] -> [x1, y1, x2, y2]
+        gt_boxes_2d[:, 0] = gt_boxes[:, 0] - gt_boxes[:, 3] / 2  # x1 = cx - l/2
+        gt_boxes_2d[:, 1] = gt_boxes[:, 1] - gt_boxes[:, 4] / 2  # y1 = cy - w/2
+        gt_boxes_2d[:, 2] = gt_boxes[:, 0] + gt_boxes[:, 3] / 2  # x2 = cx + l/2
+        gt_boxes_2d[:, 3] = gt_boxes[:, 1] + gt_boxes[:, 4] / 2  # y2 = cy + w/2
+        
+        # Calculate IoU using torchvision's box_iou
+        # Returns tensor of shape (num_anchors, num_gt)
+        iou_matrix = tv_ops.box_iou(anchor_boxes, gt_boxes_2d)
+        
+        return iou_matrix
+    
+    def visualize_matched_anchors(self, batch_results, annotations):
+        """
+        Visualize the matched anchors and their corresponding ground truth boxes for each batch.
+        Visualizes all positive anchors and their matched ground truth boxes.
+        
+        Args:
+            batch_results (Dict): Dictionary with batch indices as keys and tuples 
+                                (matched_gt_indices, matched_gt_boxes) as values
+            annotations (Dict): 
+                'boxes': Tensor of shape (N, 11) - [cx,cy,cz,l,w,h,qw,qx,qy,qz,batch_idx]
+                'categories': List of class names for each box
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import matplotlib.transforms as mtrans
+        import numpy as np
+        
+        boxes = annotations['boxes']
+        categories = annotations['categories']
+        
+        # Get number of batches
+        num_batches = len(batch_results)
+        
+        # Calculate subplot grid
+        ncols = min(num_batches, 4)
+        nrows = math.ceil(num_batches / ncols)
+        
+        fig, axes = plt.subplots(nrows, ncols, figsize=(10, 5))
+        if num_batches == 1:
+            axes = [axes]
+        elif nrows == 1 and num_batches > 1:
+            axes = axes.reshape(1, -1)
+        if num_batches > 1:
+            axes = axes.flatten()
+    
+        # Color mapping for different classes
+        class_colors = {
+            'PEDESTRIAN': 'red',
+            'TRUCK': 'blue', 
+            'LARGE_VEHICLE': 'green',
+            'REGULAR_VEHICLE': 'purple'
+        }
+        
+        for i, (batch_idx, (matched_gt_indices, matched_gt_boxes)) in enumerate(batch_results.items()):
+            ax = axes[i] if num_batches > 1 else axes[0]
+            ax.set_xlabel('X (meters)')
+            ax.set_ylabel('Y (meters)')
+            ax.grid(True, linestyle='--', alpha=0.3)
+            ax.set_aspect('equal')
+            
+            # Get positive anchors (matched to GT)
+            positive_mask = matched_gt_indices >= 0
+            positive_anchors = self.anchors[positive_mask]
+            positive_gt_indices = matched_gt_indices[positive_mask]
+            
+            # Filter GT boxes and categories for current batch
+            batch_mask = boxes[:, 10] == batch_idx
+            gt_boxes_batch = boxes[batch_mask, :10]
+            
+            # Get categories for this batch
+            batch_gt_indices = torch.where(batch_mask)[0]
+            gt_categories_batch = [categories[idx] for idx in batch_gt_indices]
+            
+            # Plot matched anchors
+            for anchor_idx, gt_idx in enumerate(positive_gt_indices):
+                anchor = positive_anchors[anchor_idx]
+                cx, cy, cz, l, w, h, qw, qx, qy, qz = anchor
+                
+                # Get anchor class
+                original_anchor_idx = torch.where(positive_mask)[0][anchor_idx]
+                anchor_class = self.anchor_classes[original_anchor_idx]
+                color = class_colors.get(anchor_class, 'gray')
+                
+                # Calculate yaw angle from quaternion - fix for numpy 2.0 warning
+                yaw = 2 * torch.atan2(qz, qw).item()
+                
+                # Create transformation for rotation around center
+                t = mtrans.Affine2D().rotate_around(cx.item(), cy.item(), yaw) + ax.transData
+                
+                # Anchor box as filled rectangle - fix color warning
+                anchor_rect = patches.Rectangle(
+                    (cx.item() - l.item()/2, cy.item() - w.item()/2),
+                    l.item(), w.item(),
+                    transform=t,
+                    facecolor=color,
+                    alpha=0.3,
+                    edgecolor=color,
+                    linewidth=1,
+                    label=f'Anchor ({anchor_class})' if anchor_idx == 0 else ""
+                )
+                ax.add_patch(anchor_rect)
+                
+                # Add anchor center point
+                ax.plot(cx.item(), cy.item(), 's', color=color, markersize=4, alpha=0.7)
+            
+            # Plot GT boxes in thick lines
+            for gt_idx, (gt_box, gt_category) in enumerate(zip(gt_boxes_batch, gt_categories_batch)):
+                cx, cy, cz, l, w, h, qw, qx, qy, qz = gt_box
+                
+                # Calculate yaw angle from quaternion - fix for numpy 2.0 warning
+                yaw = 2 * torch.atan2(qz, qw).item()
+                
+                # Create transformation for rotation around center
+                t = mtrans.Affine2D().rotate_around(cx.item(), cy.item(), yaw) + ax.transData
+                
+                # GT box as thick outline
+                gt_rect = patches.Rectangle(
+                    (cx.item() - l.item()/2, cy.item() - w.item()/2),
+                    l.item(), w.item(),
+                    transform=t,
+                    fill=False,
+                    edgecolor='black',
+                    linewidth=1,
+                    label='Ground Truth' if gt_idx == 0 else ""
+                )
+                ax.add_patch(gt_rect)
+            
+            # Set axis limits to cover 60x40 meter area
+            ax.set_ylim(0, 60)  # 60 meters in X direction
+            ax.set_xlim(0, 40)  # 40 meters in Y direction
+            
+        
+        # Hide unused subplots
+        for i in range(num_batches, len(axes) if num_batches > 1 else 1):
+            if num_batches > 1:
+                axes[i].axis('off')
+        
+        plt.suptitle('Anchor Assignment Visualization', fontsize=16)
+        plt.show()
+        
 
 # For testing/debugging
 if __name__ == "__main__":
@@ -437,7 +657,7 @@ if __name__ == "__main__":
     scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
     canvas = scatter(learned_features, sample['pillar_coords'])
     print(f"PsuedoScatter output shape: {canvas.shape}")
-    visualize_pseudo_image(canvas)
+    # visualize_pseudo_image(canvas)
 
     # Test backbone
     backbone = Backbone()
@@ -451,9 +671,9 @@ if __name__ == "__main__":
 
     # Test Anchor
     anchor = Anchor(grid_size=grid_size)
-    achors, anchor_classes = anchor.generate()
-    anchor.plot_anchors()
-    print(f"Generated {len(achors)} anchors with classes: {len(anchor_classes)}")
+    # anchor.plot_anchors()
+    batch_results = anchor.assign(sample['annotations'])
+    anchor.visualize_matched_anchors(batch_results, sample['annotations'])
 
 
 
