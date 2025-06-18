@@ -1,201 +1,150 @@
 import os
 import torch
-import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import time
-import argparse
-import joblib
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-from dotenv import load_dotenv
+import numpy as np
+import matplotlib.pyplot as plt
 
+from src.loaders.loader_Point_Pillars import PointPillarsLoader, collate_fn
 from src.models.PointPillars import PointPillarsModel, PointPillarsLoss
-from src.loaders.loader_Point_Pillars import PointPillarsLoader
 
-class AnchorGenerator:
-    """Generates anchors for PointPillars detection"""
+class LossTracker:
+    """Helper class to track and visualize losses during training."""
     
-    def __init__(self, x_range, y_range, z_range, voxel_size, anchor_sizes, target_classes, rotations=(0, np.pi/2)):
-        """
-        Args:
-            x_range: (min, max) in meters
-            y_range: (min, max) in meters
-            z_range: (min, max) in meters
-            voxel_size: (x_size, y_size) in meters
-            anchor_sizes: list of (length, width, height) for each class
-            target_classes: set of target class names
-            rotations: list of rotations to apply to anchors
-        """
-        self.x_range = x_range
-        self.y_range = y_range
-        self.z_range = z_range
-        self.voxel_size = voxel_size
-        self.anchor_sizes = anchor_sizes
-        self.target_classes = target_classes
-        self.rotations = rotations
-        
-        # Calculate grid dimensions
-        self.nx = int((x_range[1] - x_range[0]) / voxel_size[0] / 4)  # /4 due to backbone downsampling
-        self.ny = int((y_range[1] - y_range[0]) / voxel_size[1] / 4)  # /4 due to backbone downsampling
-        
-        # Generate anchors
-        self.anchors = self._generate_anchors()
-        
-    def _generate_anchors(self):
-        """Generate anchor boxes for all positions in the feature map"""
-        anchors = []
-        x_centers = np.linspace(self.x_range[0], self.x_range[1], self.nx)
-        y_centers = np.linspace(self.y_range[0], self.y_range[1], self.ny)
-        
-        # Use mean of z_range as anchor height
-        z_center = (self.z_range[0] + self.z_range[1]) / 2
-        
-        # Generate anchors for each position
-        for x in x_centers:
-            for y in y_centers:
-                for size in self.anchor_sizes:
-                    length, width, height = size
-                    for rotation in self.rotations:
-                        anchors.append([x, y, z_center, length, width, height, rotation])
-        
-        return np.array(anchors)
+    def __init__(self):
+        self.losses = {
+            'total_loss': [],
+            'cls_loss': [],
+            'box_loss': [],
+            'num_positives': []
+        }
+        self.epoch_losses = {
+            'total_loss': [],
+            'cls_loss': [],
+            'box_loss': [],
+            'num_positives': []
+        }
     
-    def encode_targets(self, batch_annotations):
-        """
-        Encode ground truth boxes to match anchor format
+    def update(self, loss_dict):
+        """Update loss history."""
+        for key, value in loss_dict.items():
+            if key in self.losses:
+                if isinstance(value, torch.Tensor):
+                    self.losses[key].append(value.item())
+                else:
+                    self.losses[key].append(value)
+    
+    def end_epoch(self):
+        """Calculate epoch averages and reset batch losses."""
+        for key in self.epoch_losses.keys():
+            if len(self.losses[key]) > 0:
+                self.epoch_losses[key].append(np.mean(self.losses[key]))
+                self.losses[key] = []  # Reset for next epoch
+    
+    def get_latest_epoch_avg(self):
+        """Get latest epoch averages."""
+        latest = {}
+        for key, values in self.epoch_losses.items():
+            latest[key] = values[-1] if values else 0.0
+        return latest
+    
+    def plot_losses(self):
+        """Plot training losses."""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         
-        Returns:
-            gt_boxes: tensor of shape [batch_size, num_anchors, 7]
-            gt_classes: tensor of shape [batch_size, num_anchors]
-            gt_directions: tensor of shape [batch_size, num_anchors]
-            pos_mask: tensor of shape [batch_size, num_anchors]
-        """
-        batch_size = len(batch_annotations)
-        num_anchors = len(self.anchors)
+        epochs = range(1, len(self.epoch_losses['total_loss']) + 1)
         
-        gt_boxes = torch.zeros((batch_size, num_anchors, 7), dtype=torch.float32)
-        gt_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long)
-        gt_directions = torch.zeros((batch_size, num_anchors), dtype=torch.long)
-        pos_mask = torch.zeros((batch_size, num_anchors), dtype=torch.bool)
+        # Total Loss
+        axes[0, 0].plot(epochs, self.epoch_losses['total_loss'], 'b-', linewidth=2)
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].grid(True, alpha=0.3)
         
-        # For each batch item
-        for b, annotations in enumerate(batch_annotations):
-            # Skip if no annotations
-            if annotations is None or len(annotations) == 0:
-                continue
-                
-            # Convert annotations to tensor format [N, 7] - (x, y, z, l, w, h, yaw)
-            num_gt = len(annotations)
-            gt_boxes_raw = torch.zeros((num_gt, 7), dtype=torch.float32)
+        # Classification Loss
+        axes[0, 1].plot(epochs, self.epoch_losses['cls_loss'], 'r-', linewidth=2)
+        axes[0, 1].set_title('Classification Loss')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Box Regression Loss
+        axes[1, 0].plot(epochs, self.epoch_losses['box_loss'], 'g-', linewidth=2)
+        axes[1, 0].set_title('Box Regression Loss')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Number of Positive Samples
+        axes[1, 1].plot(epochs, self.epoch_losses['num_positives'], 'm-', linewidth=2)
+        axes[1, 1].set_title('Positive Samples per Batch')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Count')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+
+def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir):
+    """Save model checkpoint."""
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }
+    
+    checkpoint_path = os.path.join(checkpoint_dir, f'pointpillars_epoch_{epoch}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved: {checkpoint_path}")
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    """Load model checkpoint."""
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Checkpoint loaded: {checkpoint_path}")
+        return start_epoch
+    else:
+        print(f"No checkpoint found at {checkpoint_path}")
+        return 0
+
+def validate_model(model, val_loader, criterion, device):
+    """Validate the model on validation set."""
+    model.eval()
+    val_losses = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            # Move batch to device
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device)
             
-            # Extract values from annotations
-            for i, anno in enumerate(annotations.iterrows()):
-                anno = anno[1]  # Get the pandas Series from the tuple
-                
-                # Get box center and dimensions
-                x, y, z = anno['tx_m'], anno['ty_m'], anno['tz_m']
-                l, w, h = anno['length_m'], anno['width_m'], anno['height_m']
-                
-                # Convert quaternion to yaw (rotation around z-axis)
-                qw, qx, qy, qz = anno['qw'], anno['qx'], anno['qy'], anno['qz']
-                yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
-                
-                # Store in tensor
-                gt_boxes_raw[i] = torch.tensor([x, y, z, l, w, h, yaw])
-                
-                # Get category ID
-                category = anno['category']
-                category_id = self._get_category_id(category) + 1  # Add 1 to skip background (0)
-                
-                # Find matching anchors (IoU > threshold)
-                # For simplicity, assign to closest anchor
-                ious = self._calculate_iou_2d(self.anchors, gt_boxes_raw[i].numpy())
-                max_iou_idx = np.argmax(ious)
-                
-                # Assign ground truth to this anchor
-                gt_boxes[b, max_iou_idx] = gt_boxes_raw[i]
-                gt_classes[b, max_iou_idx] = category_id
-                
-                # Determine direction class (0: forward, 1: backward)
-                # This is a simplified approach; you may need to adjust based on your dataset
-                gt_directions[b, max_iou_idx] = 0 if yaw > 0 else 1
-                
-                # Mark this anchor as positive
-                pos_mask[b, max_iou_idx] = True
+            # Forward pass
+            predictions = model(batch)
             
-        return gt_boxes, gt_classes, gt_directions, pos_mask
+            # Get anchor assignments
+            batch_assignments = model.anchor_generator.assign(batch['annotations'])
+            
+            # Compute loss
+            loss_dict = criterion(predictions, batch_assignments, batch['annotations'])
+            val_losses.append(loss_dict['total_loss'].item())
     
-    def _calculate_iou_2d(self, anchors, gt_box):
-        """Vectorized IoU calculation between anchors and a ground truth box (2D)."""
-        anchors = np.array(anchors)
-        gt_box = np.array(gt_box)
+    model.train()
+    return np.mean(val_losses)
 
-        # Anchor corners
-        x1_anchors = anchors[:, 0] - anchors[:, 3] / 2
-        y1_anchors = anchors[:, 1] - anchors[:, 4] / 2
-        x2_anchors = anchors[:, 0] + anchors[:, 3] / 2
-        y2_anchors = anchors[:, 1] + anchors[:, 4] / 2
+def main():
+    from dotenv import load_dotenv
 
-        # Ground truth box corners
-        x1_gt = gt_box[0] - gt_box[3] / 2
-        y1_gt = gt_box[1] - gt_box[4] / 2
-        x2_gt = gt_box[0] + gt_box[3] / 2
-        y2_gt = gt_box[1] + gt_box[4] / 2
-
-        # Intersection
-        x1_inter = np.maximum(x1_anchors, x1_gt)
-        y1_inter = np.maximum(y1_anchors, y1_gt)
-        x2_inter = np.minimum(x2_anchors, x2_gt)
-        y2_inter = np.minimum(y2_anchors, y2_gt)
-
-        inter_area = np.maximum(0, x2_inter - x1_inter) * np.maximum(0, y2_inter - y1_inter)
-
-        # Union
-        anchor_area = (x2_anchors - x1_anchors) * (y2_anchors - y1_anchors)
-        gt_area = (x2_gt - x1_gt) * (y2_gt - y1_gt)
-        union_area = anchor_area + gt_area - inter_area
-
-        # IoU
-        iou = inter_area / np.maximum(union_area, 1e-6)
-        return iou
-        
-    def _get_category_id(self, category):
-        """Convert category string to ID based on the full dataset classes"""
-        # Define a mapping from category names to IDs
-        categories = {}
-        for i, cat in enumerate(self.target_classes):
-            categories[cat] = i        
-
-        # Return the category ID or a default value (e.g., -1 for unknown classes)
-        return categories.get(category, -1)  # Default to -1 for unknown classes
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train PointPillars model')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation split ratio')
-    parser.add_argument('--metrics_dir', type=str, default='outputs/metrics', help='Directory to save training metrics')
-    parser.add_argument('--model_dir', type=str, default='outputs/models', help='Directory to save models')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    return parser.parse_args()
-
-
-def set_seed(seed):
-    """Set random seed for reproducibility"""
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def get_data_loaders(val_ratio=0.2, batch_size=1, seed=42, target_classes=None):
-    """Create train and validation data loaders with sklearn's train_test_split"""
-    # Load environment variables
     load_dotenv()
     dataset_path = os.getenv('DATA_PATH', default='src/data/')
 
@@ -203,377 +152,213 @@ def get_data_loaders(val_ratio=0.2, batch_size=1, seed=42, target_classes=None):
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path {dataset_path} does not exist.")
     
-    # Create dataset
-    if target_classes is not None:
-        train_dataset = PointPillarsLoader(dataset_path, split='train', target_classes=target_classes)
-    else:
-        raise Exception("Target classes must be provided for the dataset.")
-    
-    # Process all samples (or a subset for faster development)
-    processed_samples = train_dataset.process_all_samples(limit=16)
-    
-    # Get indices for train/validation split
-    indices = list(range(len(processed_samples)))
-    train_indices, val_indices = train_test_split(indices, test_size=val_ratio, random_state=seed)
-    
-    # Create subsets
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(train_dataset, val_indices)
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn
-    )
-    
-    return train_loader, val_loader
-
-
-def collate_fn(batch):
-    """Custom collate function for the point pillars data loader"""
-    pillars_list = []
-    coords_list = []
-    targets_list = []  # Keep targets as a list of lists
-
-    for i, sample in enumerate(batch):
-        pillar_data, coords_data = sample["lidar_processed"]
-
-        # Convert to tensors
-        pillars = torch.from_numpy(pillar_data).float()
-        coords = torch.from_numpy(coords_data).int()
-
-        # Add batch index to coords
-        batch_size = coords.shape[0]
-        batch_index = torch.full((batch_size, 1), i, dtype=torch.int)
-        coords = torch.cat([batch_index, coords], dim=1)
-
-        pillars_list.append(pillars)
-        coords_list.append(coords)
-        targets_list.append(sample["annotations"])  # Keep targets as is
-
-    # Pad to the maximum number of pillars
-    max_pillars = max(pillar.shape[0] for pillar in pillars_list)
-
-    padded_pillars = []
-    padded_coords = []
-
-    for pillars, coords in zip(pillars_list, coords_list):
-        num_padding = max_pillars - pillars.shape[0]
-
-        # Pad pillars and coords
-        padded_pillars.append(torch.cat([pillars, torch.zeros((num_padding, pillars.shape[1], pillars.shape[2]))], dim=0))
-        padded_coords.append(torch.cat([coords, torch.zeros((num_padding, coords.shape[1]), dtype=torch.int)], dim=0))
-
-    # Stack the padded tensors
-    pillars_stacked = torch.stack(padded_pillars)
-    coords_stacked = torch.stack(padded_coords)
-
-    return {
-        "pillars": pillars_stacked,
-        "coords": coords_stacked,
-        "targets": targets_list  # Return targets as a list of lists
+    # Training configuration
+    config = {
+        'batch_size': 2,  # Reduced for memory efficiency
+        'epochs': 50,
+        'learning_rate': 0.001,
+        'weight_decay': 1e-4,
+        'grid_size': (300, 200),
+        'grid_resolution': 0.2,
+        'num_classes': 4,
+        'save_every': 5,  # Save checkpoint every 5 epochs
+        'validate_every': 5,  # Validate every 5 epochs
+        'checkpoint_dir': 'checkpoints/',
+        'use_wandb': False,  # Set to True to use Weights & Biases logging
     }
-
-
-def train_one_epoch(model, train_loader, criterion, optimizer, device):
-    """Train for one epoch"""
-    model.train()
-    total_loss = 0
     
-    # Initialize AnchorGenerator 
-    anchor_generator = AnchorGenerator(
-        x_range=(-100, 100),
-        y_range=(-100, 100),
-        z_range=(-3, 1),
-        voxel_size=(0.3, 0.3),
-        anchor_sizes=[(4.5, 2.0, 1.7),  # Car
-                    (0.8, 0.8, 1.7),  # Pedestrian
-                    (8.0, 2.5, 3.0),  # Truck/Large Vehicle
-                    ],
-        target_classes=train_loader.dataset.dataset.classes
-    )
-    
-    progress_bar = tqdm(train_loader, desc="Training")
-    for batch_idx, batch in enumerate(progress_bar):
-        # Get data
-        pillars = batch["pillars"].to(device)
-        coords = batch["coords"].to(device)
-        targets = batch["targets"]  # List of targets for each sample
-        
-        # Forward pass
-        bbox_preds, cls_scores, dir_scores = model(pillars, coords)
-        
-        # Convert targets to expected format for loss calculation
-        gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
-        
-        # Move targets to device
-        gt_boxes = gt_boxes.to(device)
-        gt_cls = gt_cls.to(device)
-        gt_dir = gt_dir.to(device)
-        pos_mask = pos_mask.to(device)
-        
-        # Get predictions in proper format for loss calculation
-        # Reshape 4D outputs to 3D tensors [B, H*W, C]
-        B = bbox_preds.shape[0]
-        num_classes = cls_scores.shape[1]
-        
-        # Reshape bbox_preds: [B, num_classes*7, H, W] -> [B, H*W, 7]
-        bbox_preds = bbox_preds.view(B, num_classes, 7, -1)  # [B, num_classes, 7, H*W]
-        bbox_preds = bbox_preds.permute(0, 3, 1, 2)  # [B, H*W, num_classes, 7]
-        bbox_preds = bbox_preds.reshape(-1, 7)  # [B*H*W*num_classes, 7]
-        
-        # Reshape cls_scores: [B, num_classes, H, W] -> [B, H*W, num_classes]
-        H, W = cls_scores.shape[2], cls_scores.shape[3]
-        cls_scores = cls_scores.permute(0, 2, 3, 1)  # [B, H, W, num_classes]
-        cls_scores = cls_scores.reshape(-1, num_classes)  # [B*H*W, num_classes]
-        
-        # Reshape dir_scores: [B, 2, H, W] -> [B, H*W, 2]
-        dir_scores = dir_scores.permute(0, 2, 3, 1)  # [B, H, W, 2]
-        dir_scores = dir_scores.reshape(-1, 2)  # [B*H*W, 2]
-        
-        # Flatten targets
-        gt_boxes = gt_boxes.reshape(-1, 7)
-        gt_cls = gt_cls.reshape(-1)
-        gt_dir = gt_dir.reshape(-1)
-        pos_mask = pos_mask.reshape(-1)
-        
-        # Calculate loss
-        total_batch_loss, loc_loss, cls_loss, dir_loss = criterion(
-            pred_boxes=bbox_preds, 
-            gt_boxes=gt_boxes, 
-            pred_cls=cls_scores, 
-            gt_cls=gt_cls, 
-            pred_dir=dir_scores, 
-            gt_dir=gt_dir, 
-            pos_mask=pos_mask
-        )
-        
-        # Backward pass and optimize
-        optimizer.zero_grad()
-        total_batch_loss.backward()
-        optimizer.step()
-        
-        # Update progress
-        total_loss += total_batch_loss.item()
-        progress_bar.set_postfix({"batch_loss": total_batch_loss.item(), 
-                                "loc_loss": loc_loss.item(),
-                                "cls_loss": cls_loss.item(),
-                                "dir_loss": dir_loss.item()})
-    
-    return total_loss / len(train_loader)
-
-
-def validate(model, val_loader, criterion, device):
-    """Validate the model"""
-    model.eval()
-    total_loss = 0
-    
-    # Initialize AnchorGenerator - same settings as in train_one_epoch
-    anchor_generator = AnchorGenerator(
-        x_range=(-100, 100),
-        y_range=(-100, 100),
-        z_range=(-3, 1),
-        voxel_size=(0.3, 0.3),
-        anchor_sizes=[(4.5, 2.0, 1.7),  # Car
-                    (0.8, 0.8, 1.7),  # Pedestrian
-                    (8.0, 2.5, 3.0),  # Truck/Large Vehicle
-                    ],
-        target_classes=val_loader.dataset.dataset.classes
-    )
-    
-    progress_bar = tqdm(val_loader, desc="Validation")
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(progress_bar):
-            # Get data
-            pillars = batch["pillars"].to(device)
-            coords = batch["coords"].to(device)
-            targets = batch["targets"]
-            
-            # Forward pass
-            bbox_preds, cls_scores, dir_scores = model(pillars, coords)
-            
-            # Convert targets to expected format for loss calculation
-            gt_boxes, gt_cls, gt_dir, pos_mask = anchor_generator.encode_targets(targets)
-            
-            # Move targets to device
-            gt_boxes = gt_boxes.to(device)
-            gt_cls = gt_cls.to(device)
-            gt_dir = gt_dir.to(device)
-            pos_mask = pos_mask.to(device)
-            
-            # Get predictions in proper format for loss calculation
-            # Reshape 4D outputs to 3D tensors [B, H*W, C]
-            B = bbox_preds.shape[0]
-            num_classes = cls_scores.shape[1]
-            
-            # Reshape bbox_preds: [B, num_classes*7, H, W] -> [B, H*W, 7]
-            bbox_preds = bbox_preds.view(B, num_classes, 7, -1)  # [B, num_classes, 7, H*W]
-            bbox_preds = bbox_preds.permute(0, 3, 1, 2)  # [B, H*W, num_classes, 7]
-            bbox_preds = bbox_preds.reshape(-1, 7)  # [B*H*W*num_classes, 7]
-            
-            # Reshape cls_scores: [B, num_classes, H, W] -> [B, H*W, num_classes]
-            H, W = cls_scores.shape[2], cls_scores.shape[3]
-            cls_scores = cls_scores.permute(0, 2, 3, 1)  # [B, H, W, num_classes]
-            cls_scores = cls_scores.reshape(-1, num_classes)  # [B*H*W, num_classes]
-            
-            # Reshape dir_scores: [B, 2, H, W] -> [B, H*W, 2]
-            dir_scores = dir_scores.permute(0, 2, 3, 1)  # [B, H, W, 2]
-            dir_scores = dir_scores.reshape(-1, 2)  # [B*H*W, 2]
-            
-            # Flatten targets
-            gt_boxes = gt_boxes.reshape(-1, 7)
-            gt_cls = gt_cls.reshape(-1)
-            gt_dir = gt_dir.reshape(-1)
-            pos_mask = pos_mask.reshape(-1)
-            
-            # Calculate loss
-            total_batch_loss, loc_loss, cls_loss, dir_loss = criterion(
-                pred_boxes=bbox_preds, 
-                gt_boxes=gt_boxes, 
-                pred_cls=cls_scores, 
-                gt_cls=gt_cls, 
-                pred_dir=dir_scores, 
-                gt_dir=gt_dir, 
-                pos_mask=pos_mask
-            )
-            
-            # Update progress
-            total_loss += total_batch_loss.item()
-            progress_bar.set_postfix({"batch_loss": total_batch_loss.item(),
-                                    "loc_loss": loc_loss.item(),
-                                    "cls_loss": cls_loss.item(),
-                                    "dir_loss": dir_loss.item()})
-    
-    return total_loss / len(val_loader)
-
-
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-    
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Create directories
-    os.makedirs(args.metrics_dir, exist_ok=True)
-    os.makedirs(args.model_dir, exist_ok=True)
+    # Create datasets
+    print("Creating datasets...")
+    train_dataset = PointPillarsLoader(dataset_path, split='train')
+    val_dataset = PointPillarsLoader(dataset_path, split='val')
     
-    # Initialize metrics dictionary to store training history
-    metrics = {
-        'train_loss': [],
-        'val_loss': [],
-        'learning_rate': [],
-        'epochs': [],
-        'best_val_loss': float('inf'),
-        'best_epoch': -1
-    }
-    
-    # Get data loaders
-    train_loader, val_loader = get_data_loaders(
-        val_ratio=args.val_ratio, 
-        batch_size=args.batch_size,
-        seed=args.seed,
-        target_classes={'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True if device.type == 'cuda' else False
     )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Validation batches: {len(val_loader)}")
 
-    # for batch_idx, batch in enumerate(train_loader):
-    #     print("\nInspecting batch:", batch_idx)
-    #     print(f"Pillars shape: {batch['pillars'].shape}")
-    #     print(f"Coords shape: {batch['coords'].shape}")
-    #     print(f"Number of targets: {len(batch['targets'])}")
-
-    # for batch_idx, batch in enumerate(val_loader):
-    #     print("\nInspecting validation batch:", batch_idx)
-    #     print(f"Pillars shape: {batch['pillars'].shape}")
-    #     print(f"Coords shape: {batch['coords'].shape}")
-    #     print(f"Number of targets: {len(batch['targets'])}")
+    # Initialize model, loss function, and optimizer
+    print("Initializing model...")
+    model = PointPillarsModel(
+        grid_size=config['grid_size'], 
+        num_classes=config['num_classes'],
+        grid_resolution=config['grid_resolution']
+    ).to(device)
     
-    # Get number of classes from dataset
-    num_classes = len(train_loader.dataset.dataset.classes) + 1  # +1 for background
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
-    # Initialize model and loss
-    model = PointPillarsModel(num_classes=num_classes).to(device)
-    criterion = PointPillarsLoss().to(device)
+    criterion = PointPillarsLoss(
+        cls_weight=1.0,
+        box_weight=2.0,
+        focal_alpha=0.25,
+        focal_gamma=2.0
+    )
     
-    # Initialize optimizer and scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    optimizer = optim.Adam(
+        model.parameters(), 
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay']
+    )
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    
+    # Loss tracker
+    loss_tracker = LossTracker()
+    
+    # Load checkpoint if exists
+    start_epoch = load_checkpoint(model, optimizer, 
+                                 os.path.join(config['checkpoint_dir'], 'latest.pth'))
     
     # Training loop
+    print("\nStarting training...")
+    model.train()
     best_val_loss = float('inf')
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
+    
+    for epoch in range(start_epoch, config['epochs']):
+        print(f"\n=== Epoch {epoch + 1}/{config['epochs']} ===")
         
-        # Train
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        # Training phase
+        model.train()
+        epoch_start_time = time.time()
         
-        # Validate
-        val_loss = validate(model, val_loader, criterion, device)
+        # Progress bar for batches
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
         
-        # Update learning rate scheduler
-        current_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_loss)
-        
-        # Log metrics
-        print(f"Train Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
-        
-        # Update metrics dictionary
-        metrics['train_loss'].append(train_loss)
-        metrics['val_loss'].append(val_loss)
-        metrics['learning_rate'].append(current_lr)
-        metrics['epochs'].append(epoch + 1)
-        
-        # Save metrics to disk
-        joblib.dump(metrics, os.path.join(args.metrics_dir, 'training_metrics.joblib'))
-        
-        # Track best validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            metrics['best_val_loss'] = best_val_loss
-            metrics['best_epoch'] = epoch + 1
+        for batch_idx, batch in enumerate(pbar):
+            # Move batch to device
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device)
             
-            # Save the best model
-            print(f"New best validation loss: {val_loss:.6f}, saving model...")
-            model_path = os.path.join(args.model_dir, 'best_model.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_loss': train_loss,
-                'num_classes': num_classes
-            }, model_path)
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            try:
+                # Forward pass
+                predictions = model(batch)
+                
+                # Get anchor assignments
+                batch_assignments = model.anchor_generator.assign(batch['annotations'])
+                
+                # Compute loss
+                loss_dict = criterion(predictions, batch_assignments, batch['annotations'])
+                total_loss = loss_dict['total_loss']
+                
+                # Check for NaN loss
+                if torch.isnan(total_loss):
+                    print(f"Warning: NaN loss detected at epoch {epoch}, batch {batch_idx}")
+                    continue
+                
+                # Backward pass
+                total_loss.backward()
+                
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                
+                # Update weights
+                optimizer.step()
+                
+                # Track losses
+                loss_tracker.update(loss_dict)
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'Total': f"{loss_dict['total_loss'].item():.4f}",
+                    'Cls': f"{loss_dict['cls_loss'].item():.4f}",
+                    'Box': f"{loss_dict['box_loss'].item():.4f}",
+                    'Pos': f"{loss_dict['num_positives']}"
+                })
+                
+                
+            except Exception as e:
+                print(f"Error in batch {batch_idx}: {str(e)}")
+                continue
+        
+        # End of epoch processing
+        loss_tracker.end_epoch()
+        epoch_time = time.time() - epoch_start_time
+        
+        # Get epoch averages
+        epoch_losses = loss_tracker.get_latest_epoch_avg()
+        
+        print(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s")
+        print(f"Average losses - Total: {epoch_losses['total_loss']:.4f}, "
+              f"Cls: {epoch_losses['cls_loss']:.4f}, "
+              f"Box: {epoch_losses['box_loss']:.4f}, "
+              f"Pos: {epoch_losses['num_positives']:.1f}")
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Validation
+        if (epoch + 1) % config['validate_every'] == 0:
+            print("Running validation...")
+            val_loss = validate_model(model, val_loader, criterion, device)
+            print(f"Validation loss: {val_loss:.4f}")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, optimizer, epoch, val_loss, 
+                               os.path.join(config['checkpoint_dir'], 'best.pth'))
+                print(f"New best validation loss: {val_loss:.4f}")
+            
+        # Save checkpoint
+        if (epoch + 1) % config['save_every'] == 0:
+            save_checkpoint(model, optimizer, epoch, epoch_losses['total_loss'], 
+                           config['checkpoint_dir'])
+        
+        # Save latest checkpoint
+        save_checkpoint(model, optimizer, epoch, epoch_losses['total_loss'], 
+                       os.path.join(config['checkpoint_dir'], 'latest.pth'))
     
-    # Save final metrics
-    joblib.dump(metrics, os.path.join(args.metrics_dir, 'final_metrics.joblib'))
+    print("\nTraining completed!")
     
-    # Save final model
-    final_model_path = os.path.join(args.model_dir, 'final_model.pth')
-    torch.save({
-        'epoch': args.epochs - 1,
+    # Plot training losses
+    print("Plotting training losses...")
+    loss_tracker.plot_losses()
+    
+    # Final model save
+    final_checkpoint = {
+        'epoch': config['epochs'],
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_loss,
-        'train_loss': train_loss,
-        'num_classes': num_classes
-    }, final_model_path)
+        'config': config,
+        'loss_history': loss_tracker.epoch_losses
+    }
     
-    print("Training complete!")
-    print(f"Best model achieved validation loss of {metrics['best_val_loss']:.6f} at epoch {metrics['best_epoch']}")
-    print(f"Best model saved to {os.path.join(args.model_dir, 'best_model.pth')}")
-    print(f"Final model saved to {os.path.join(args.model_dir, 'final_model.pth')}")
-
-
+    final_path = os.path.join(config['checkpoint_dir'], 'final_model.pth')
+    torch.save(final_checkpoint, final_path)
+    print(f"Final model saved: {final_path}")
+    
 if __name__ == "__main__":
     main()
 

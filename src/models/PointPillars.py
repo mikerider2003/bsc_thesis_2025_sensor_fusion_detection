@@ -179,53 +179,469 @@ def visualize_pseudo_image(canvas: torch.Tensor, title: str = "Pseudo Image"):
 class Backbone(nn.Module):
     def __init__(self, in_channels=64):
         super().__init__()
-        # Example backbone: 3 convolutional blocks
+        # Block 1: Downsample 2x
         self.block1 = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.Conv2d(in_channels, 64, 3, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
+            nn.ReLU()
         )
+        # Block 2: Downsample 2x
         self.block2 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
             nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
+            nn.ReLU()
         )
+        # Block 3: Maintain resolution
         self.block3 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # Downsample by 2
+            nn.Conv2d(128, 256, 3, stride=1, padding=1),
             nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
+            nn.ReLU()
+        )
+        # Block 4: Maintain resolution
+        self.block4 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU()
         )
 
     def forward(self, x):
-        # x: [B, C, H, W]
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        return x  # [B, 256, H/8, W/8]
+        x = self.block1(x)  # 1/2
+        x = self.block2(x)  # 1/4
+        x = self.block3(x)  # 1/4
+        x = self.block4(x)  # 1/4
+        return x
 
 class DetectionHead(nn.Module):
-    def __init__(self, in_channels=256, num_classes=3, box_code_size=9):
+    def __init__(self, in_channels=256, num_classes=4, num_anchors_per_location=8, box_code_size=10):
         """
         Args:
             in_channels (int): Number of channels from the backbone output.
             num_classes (int): Number of object classes (excluding background).
-            box_code_size (int): Number of box regression parameters (default 9: cx, cy, cz, l, w, h, qw, qx, qy).
+            num_anchors_per_location (int): Number of anchors per spatial location.
+            box_code_size (int): Number of box regression parameters [cx,cy,cz,l,w,h,qw,qx,qy,qz, batch_idx].
         """
         super().__init__()
-        self.box_head = nn.Conv2d(in_channels, box_code_size, kernel_size=1)
-        self.cls_head = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+        self.num_classes = num_classes
+        self.num_anchors_per_location = num_anchors_per_location
+        
+        # Regression head: predicts residuals for each anchor
+        self.box_head = nn.Conv2d(
+            in_channels, 
+            num_anchors_per_location * box_code_size, 
+            kernel_size=1
+        )
+        
+        # Classification head: predicts class scores for each anchor
+        self.cls_head = nn.Conv2d(
+            in_channels, 
+            num_anchors_per_location * num_classes, 
+            kernel_size=1
+        )
 
     def forward(self, x):
         """
         Args:
             x (torch.Tensor): Backbone feature map, shape [B, in_channels, H, W]
         Returns:
-            box_preds (torch.Tensor): [B, box_code_size, H, W]
-            cls_preds (torch.Tensor): [B, num_classes, H, W]
+            box_preds (torch.Tensor): [B, H, W, num_anchors_per_location, box_code_size]
+            cls_preds (torch.Tensor): [B, H, W, num_anchors_per_location, num_classes]
         """
-        box_preds = self.box_head(x)
-        cls_preds = self.cls_head(x)
+        B, _, H, W = x.shape
+        
+        # Raw predictions
+        box_preds = self.box_head(x)  # [B, num_anchors*box_code_size, H, W]
+        cls_preds = self.cls_head(x)  # [B, num_anchors*num_classes, H, W]
+        
+        # Reshape to separate anchors and features
+        box_preds = box_preds.view(B, self.num_anchors_per_location, -1, H, W)
+        box_preds = box_preds.permute(0, 3, 4, 1, 2).contiguous()  # [B, H, W, num_anchors, box_code_size]
+        
+        cls_preds = cls_preds.view(B, self.num_anchors_per_location, -1, H, W)
+        cls_preds = cls_preds.permute(0, 3, 4, 1, 2).contiguous()  # [B, H, W, num_anchors, num_classes]
+        
         return box_preds, cls_preds
+
+class PointPillarsModel(nn.Module):
+    def __init__(self, grid_size, num_classes=4, grid_resolution=0.2):
+        """
+        Complete PointPillars model.
+        
+        Args:
+            grid_size (tuple): Size of the grid in cells (height, width)
+            num_classes (int): Number of object classes
+            grid_resolution (float): Meters per grid cell
+        """
+        super().__init__()
+        # 4x downsampling
+        self.downsample_factor = 4
+        self.downsampled_grid_size = (
+            grid_size[0] // self.downsample_factor,
+            grid_size[1] // self.downsample_factor
+        )
+        
+        # Components
+        self.pfn = PillarFeatureNet()
+        self.scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
+        self.backbone = Backbone()  # 4x downsampling
+        
+        # Anchor generator for downsampled grid
+        self.anchor_generator = Anchor(
+            grid_size=self.downsampled_grid_size,
+            grid_resolution=grid_resolution * self.downsample_factor
+        )
+        
+        # Detection head
+        self.detection_head = DetectionHead(
+            in_channels=256,
+            num_classes=num_classes + 1,  
+            num_anchors_per_location=len(self.anchor_generator.anchor_sizes) * 
+                                     len(self.anchor_generator.anchor_rotations),
+            box_code_size=10    # [cx,cy,cz,l,w,h,qw,qx,qy,qz, batch_idx]
+        )
+        
+    def forward(self, batch):
+        """
+        Forward pass of PointPillars model.
+        
+        Args:
+            batch (dict): Batch data containing:
+                - 'features': pillar features [P, N, 9]
+                - 'pillar_coords': pillar coordinates [P, 3]
+                
+        Returns:
+            dict: Predictions containing:
+                - 'box_preds': Box regression predictions
+                - 'cls_preds': Classification predictions
+                - 'anchors': Generated anchors
+        """
+        # Extract pillar features
+        pillar_features = batch['features']
+        pillar_coords = batch['pillar_coords']
+        
+        # 1. Pillar Feature Network
+        learned_features = self.pfn(pillar_features)
+        
+        # 2. Pseudo Image Creation
+        canvas = self.scatter(learned_features, pillar_coords)
+        
+        # 3. Backbone
+        backbone_features = self.backbone(canvas)
+        
+        # 4. Detection Head
+        box_preds, cls_preds = self.detection_head(backbone_features)
+        
+        return {
+            'box_preds': box_preds,
+            'cls_preds': cls_preds,
+            'anchors': self.anchor_generator.anchors,
+            'anchor_classes': self.anchor_generator.anchor_classes
+        }
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class PointPillarsLoss(nn.Module):
+    def __init__(self, 
+                 cls_weight=1.0, 
+                 box_weight=2.0, 
+                 pos_cls_weight=1.0, 
+                 neg_cls_weight=1.0,
+                 focal_alpha=0.25,
+                 focal_gamma=2.0):
+        """
+        PointPillars Loss Function combining classification and regression losses.
+        """
+        super().__init__()
+        self.cls_weight = cls_weight
+        self.box_weight = box_weight
+        self.pos_cls_weight = pos_cls_weight
+        self.neg_cls_weight = neg_cls_weight
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        
+        # Loss functions
+        self.smooth_l1_loss = nn.SmoothL1Loss(reduction='none')
+        
+    def forward(self, predictions, batch_assignments, annotations):
+        """
+        Compute the total loss for PointPillars.
+        """
+        box_preds = predictions['box_preds']
+        cls_preds = predictions['cls_preds']
+        anchors = predictions['anchors']
+        
+        B, H, W, num_anchors_per_location, _ = box_preds.shape
+        num_classes = cls_preds.shape[-1]
+        
+        # Flatten predictions for easier processing
+        box_preds_flat = box_preds.view(-1, 10)  # [B*H*W*num_anchors, 10]
+        cls_preds_flat = cls_preds.view(-1, num_classes)  # [B*H*W*num_anchors, num_classes]
+        
+        total_cls_loss = 0.0
+        total_box_loss = 0.0
+        total_positive_samples = 0
+        
+        # Process each batch
+        for batch_idx in range(B):
+            if batch_idx not in batch_assignments:
+                continue
+                
+            matched_gt_indices, matched_gt_boxes = batch_assignments[batch_idx]
+            
+            # Get predictions for current batch
+            start_idx = batch_idx * H * W * num_anchors_per_location
+            end_idx = start_idx + H * W * num_anchors_per_location
+            
+            batch_box_preds = box_preds_flat[start_idx:end_idx]
+            batch_cls_preds = cls_preds_flat[start_idx:end_idx]
+            
+            # Classification loss
+            cls_loss = self._compute_classification_loss(
+                batch_cls_preds, matched_gt_indices, annotations, batch_idx
+            )
+            
+            # Box regression loss (only for positive samples)
+            box_loss, num_positives = self._compute_box_regression_loss(
+                batch_box_preds, matched_gt_indices, matched_gt_boxes, anchors
+            )
+            
+            total_cls_loss += cls_loss
+            total_box_loss += box_loss
+            total_positive_samples += num_positives
+        
+        # Normalize losses
+        if total_positive_samples > 0:
+            total_box_loss = total_box_loss / total_positive_samples
+        else:
+            total_box_loss = torch.tensor(0.0, device=box_preds.device)
+        
+        total_cls_loss = total_cls_loss / B
+        
+        # Check for NaN values and handle them
+        if torch.isnan(total_cls_loss):
+            print("Warning: Classification loss is NaN, setting to 0")
+            total_cls_loss = torch.tensor(0.0, device=box_preds.device)
+            
+        if torch.isnan(total_box_loss):
+            print("Warning: Box loss is NaN, setting to 0")
+            total_box_loss = torch.tensor(0.0, device=box_preds.device)
+        
+        # Weighted total loss
+        total_loss = self.cls_weight * total_cls_loss + self.box_weight * total_box_loss
+        
+        return {
+            'total_loss': total_loss,
+            'cls_loss': total_cls_loss,
+            'box_loss': total_box_loss,
+            'num_positives': total_positive_samples
+        }
+    
+    def _compute_classification_loss(self, cls_preds, matched_gt_indices, annotations, batch_idx):
+        num_anchors = cls_preds.shape[0]
+        num_classes = cls_preds.shape[1]  # Now includes background
+        
+        # Initialize targets to BACKGROUND CLASS (last index)
+        cls_targets = torch.full(
+            (num_anchors,), 
+            num_classes - 1,  # Background class index
+            dtype=torch.long, 
+            device=cls_preds.device
+        )
+        
+        # Get GT boxes for current batch
+        boxes = annotations['boxes']
+        categories = annotations['categories']
+        batch_mask = boxes[:, 10] == batch_idx
+        batch_categories = [categories[i] for i, mask in enumerate(batch_mask) if mask]
+        
+        # Class name to index mapping (background is last)
+        class_to_idx = {
+            'PEDESTRIAN': 0,
+            'TRUCK': 1, 
+            'LARGE_VEHICLE': 2,
+            'REGULAR_VEHICLE': 3
+        }
+        # Background is automatically num_classes-1
+        
+        # Set positive sample targets
+        positive_mask = matched_gt_indices >= 0
+        if positive_mask.sum() > 0:
+            gt_indices = matched_gt_indices[positive_mask]
+            for i, gt_idx in enumerate(gt_indices):
+                anchor_idx = torch.where(positive_mask)[0][i]
+                if gt_idx < len(batch_categories):
+                    cls_name = batch_categories[gt_idx]
+                    # Only set if valid class
+                    if cls_name in class_to_idx:
+                        cls_targets[anchor_idx] = class_to_idx[cls_name]
+        
+        # Compute focal loss
+        cls_loss = self._focal_loss(cls_preds, cls_targets, positive_mask)
+        
+        return cls_loss
+    
+    def _focal_loss(self, predictions, targets, positive_mask):
+        """
+        Compute multi-class focal loss with explicit background class.
+        Uses softmax instead of sigmoid.
+        """
+        num_classes = predictions.shape[1]
+        
+        # Convert targets to one-hot
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
+        
+        # Compute softmax probabilities
+        log_softmax = F.log_softmax(predictions, dim=1)
+        softmax = torch.exp(log_softmax)
+        
+        # Get probability of true class
+        p_t = torch.sum(softmax * targets_one_hot, dim=1)
+        
+        # Compute cross entropy
+        ce_loss = -torch.sum(log_softmax * targets_one_hot, dim=1)
+        
+        # Focal factor
+        focal_factor = (1 - p_t) ** self.focal_gamma
+        
+        # Apply focal weighting
+        focal_loss = focal_factor * ce_loss
+        
+        # Weight positive and negative samples differently
+        pos_weight = positive_mask.float() * self.pos_cls_weight
+        neg_weight = (~positive_mask).float() * self.neg_cls_weight
+        sample_weights = pos_weight + neg_weight
+        
+        # Apply sample weighting
+        weighted_loss = focal_loss * sample_weights
+        
+        # Return mean loss
+        total_weight = sample_weights.sum()
+        if total_weight > 0:
+            return weighted_loss.sum() / total_weight
+        else:
+            return torch.tensor(0.0, device=predictions.device)
+    
+    def _compute_box_regression_loss(self, box_preds, matched_gt_indices, matched_gt_boxes, anchors):
+        """
+        Compute smooth L1 loss for box regression (only for positive samples).
+        """
+        positive_mask = matched_gt_indices >= 0
+        num_positives = positive_mask.sum().item()
+        
+        if num_positives == 0:
+            return torch.tensor(0.0, device=box_preds.device), 0
+        
+        # Get positive predictions and targets
+        pos_box_preds = box_preds[positive_mask]
+        pos_matched_gt = matched_gt_boxes[positive_mask]
+        pos_anchors = anchors[positive_mask]
+        
+        # Encode GT boxes relative to anchors
+        encoded_gt = self._encode_boxes(pos_matched_gt, pos_anchors)
+        
+        # Check for NaN in encoded targets
+        if torch.isnan(encoded_gt).any():
+            print("Warning: NaN found in encoded GT boxes")
+            # Replace NaN with zeros
+            encoded_gt = torch.where(torch.isnan(encoded_gt), torch.zeros_like(encoded_gt), encoded_gt)
+        
+        # Compute smooth L1 loss
+        box_loss = self.smooth_l1_loss(pos_box_preds, encoded_gt)
+        
+        # Weight different box parameters differently
+        box_weights = torch.tensor([
+            1.0, 1.0, 1.0,  # cx, cy, cz
+            2.0, 2.0, 2.0,  # l, w, h (size more important)
+            1.0, 1.0, 1.0, 1.0  # quaternion components
+        ], device=box_loss.device)
+        
+        weighted_box_loss = box_loss * box_weights.unsqueeze(0)
+        
+        # Check for NaN in loss
+        if torch.isnan(weighted_box_loss).any():
+            print("Warning: NaN found in box loss")
+            return torch.tensor(0.0, device=box_preds.device), num_positives
+        
+        return weighted_box_loss.sum(), num_positives
+    
+    def quaternion_multiply(q1, q2):
+        w1, x1, y1, z1 = q1.unbind(dim=1)
+        w2, x2, y2, z2 = q2.unbind(dim=1)
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        return torch.stack([w, x, y, z], dim=1)
+
+    
+    def _encode_boxes(self, gt_boxes, anchors):
+        """
+        Encode ground truth boxes relative to anchor boxes with correct quaternion rotation.
+        """
+        # Extract components
+        gt_center = gt_boxes[:, :3]  # cx, cy, cz
+        gt_size = gt_boxes[:, 3:6]   # l, w, h
+        gt_quat = gt_boxes[:, 6:10]  # qw, qx, qy, qz
+        
+        anchor_center = anchors[:, :3]
+        anchor_size = anchors[:, 3:6]
+        anchor_quat = anchors[:, 6:10]
+        
+        # Clamp sizes to avoid division by zero
+        anchor_size = torch.clamp(anchor_size, min=1e-6)
+        gt_size = torch.clamp(gt_size, min=1e-6)
+        
+        # Encode centers as residuals normalized by anchor size
+        encoded_center = (gt_center - anchor_center) / anchor_size
+        
+        # Encode sizes as log ratios
+        size_ratios = gt_size / anchor_size
+        encoded_size = torch.log(size_ratios)
+        
+        # ------ FIXED QUATERNION HANDLING ------
+        # Normalize quaternions
+        gt_quat_norm = F.normalize(gt_quat, p=2, dim=1)
+        anchor_quat_norm = F.normalize(anchor_quat, p=2, dim=1)
+        
+        # Compute relative rotation: q_rel = gt_quat * anchor_quat_inv
+        # Create inverse anchor quaternions (conjugate for unit quaternions)
+        anchor_quat_inv = torch.stack([
+            anchor_quat_norm[:, 0],   # w component stays positive
+            -anchor_quat_norm[:, 1],  # x component negated
+            -anchor_quat_norm[:, 2],  # y component negated
+            -anchor_quat_norm[:, 3]   # z component negated
+        ], dim=1)
+        
+        # Quaternion multiplication: q_rel = gt_quat_norm * anchor_quat_inv
+        w1, x1, y1, z1 = gt_quat_norm.unbind(dim=1)
+        w2, x2, y2, z2 = anchor_quat_inv.unbind(dim=1)
+        
+        encoded_quat = torch.stack([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,  # w component
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,  # x component
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,  # y component
+            w1*z2 + x1*y2 - y1*x2 + z1*w2   # z component
+        ], dim=1)
+        
+        # Normalize relative quaternion
+        encoded_quat = F.normalize(encoded_quat, p=2, dim=1)
+        # ------ END FIXED QUATERNION HANDLING ------
+        
+        # Combine all encoded components
+        encoded_boxes = torch.cat([encoded_center, encoded_size, encoded_quat], dim=1)
+        
+        # Final NaN safety check
+        if torch.isnan(encoded_boxes).any():
+            print("Warning: NaN detected in box encoding")
+            encoded_boxes = torch.where(
+                torch.isnan(encoded_boxes),
+                torch.zeros_like(encoded_boxes),
+                encoded_boxes
+            )
+        
+        return encoded_boxes
 
 class Anchor():
     def __init__(self, grid_size, grid_resolution=0.2, anchor_sizes=None, anchor_rotations=None):
@@ -517,7 +933,7 @@ class Anchor():
         ncols = min(num_batches, 4)
         nrows = math.ceil(num_batches / ncols)
         
-        fig, axes = plt.subplots(nrows, ncols, figsize=(10, 5))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5))
         if num_batches == 1:
             axes = [axes]
         elif nrows == 1 and num_batches > 1:
@@ -610,6 +1026,26 @@ class Anchor():
             # Set axis limits to cover 60x40 meter area
             ax.set_ylim(0, 60)  # 60 meters in X direction
             ax.set_xlim(0, 40)  # 40 meters in Y direction
+
+            # Add legend (only for first subplot to avoid clutter)
+            if i == 0:
+                # Create legend elements for anchor classes
+                legend_elements = []
+                
+                # Add GT boxes legend
+                legend_elements.append(
+                    patches.Patch(facecolor='none', edgecolor='black', linewidth=3, label='Ground Truth')
+                )
+                
+                # Add anchor class colors
+                for class_name, color in class_colors.items():
+                    legend_elements.append(
+                        patches.Patch(facecolor=color, alpha=0.3, edgecolor=color, 
+                                    label=f'Anchor ({class_name})')
+                    )
+                
+                ax.legend(handles=legend_elements, loc='upper right', 
+                         bbox_to_anchor=(1.0, 1.0), fontsize=8)
             
         
         # Hide unused subplots
@@ -618,8 +1054,50 @@ class Anchor():
                 axes[i].axis('off')
         
         plt.suptitle('Anchor Assignment Visualization', fontsize=16)
+        plt.tight_layout()
         plt.show()
-        
+
+def compute_loss_example():
+    """Example of how to use the loss function."""
+    
+    # Mock predictions (normally from your model)
+    B, H, W, num_anchors, num_classes = 2, 15, 10, 8, 4
+    
+    # Use more realistic values to avoid NaN
+    predictions = {
+        'box_preds': torch.randn(B, H, W, num_anchors, 10) * 0.1,  # Smaller variance
+        'cls_preds': torch.randn(B, H, W, num_anchors, num_classes) * 0.5,
+        'anchors': torch.abs(torch.randn(H * W * num_anchors, 10)) + 0.1  # Positive values
+    }
+    
+    # Mock batch assignments (normally from anchor.assign())
+    total_anchors = H * W * num_anchors
+    batch_assignments = {
+        0: (torch.randint(-1, 5, (total_anchors,)), 
+            torch.abs(torch.randn(total_anchors, 10)) + 0.1),  # Positive GT boxes
+        1: (torch.randint(-1, 3, (total_anchors,)), 
+            torch.abs(torch.randn(total_anchors, 10)) + 0.1)
+    }
+    
+    # Mock annotations with proper batch indices
+    annotations = {
+        'boxes': torch.cat([
+            torch.cat([torch.abs(torch.randn(4, 10)) + 0.1, torch.zeros(4, 1)], dim=1),  # batch 0
+            torch.cat([torch.abs(torch.randn(4, 10)) + 0.1, torch.ones(4, 1)], dim=1)    # batch 1
+        ], dim=0),
+        'categories': ['PEDESTRIAN', 'TRUCK', 'REGULAR_VEHICLE', 'LARGE_VEHICLE'] * 2
+    }
+    
+    # Compute loss
+    loss_fn = PointPillarsLoss()
+    loss_dict = loss_fn(predictions, batch_assignments, annotations)
+    
+    print("Loss computation example:")
+    for key, value in loss_dict.items():
+        if isinstance(value, torch.Tensor):
+            print(f"{key}: {value.item():.4f}")
+        else:
+            print(f"{key}: {value}")
 
 # For testing/debugging
 if __name__ == "__main__":
@@ -647,38 +1125,45 @@ if __name__ == "__main__":
     sample = next(iter(data_loader))
     grid_size = (sample['grid_dims'][0], sample['grid_dims'][1])
     
-    # Test Pillar Feature Network
-    pfn = PillarFeatureNet(num_input_features=9, num_output_features=64)
-    pillar_features = sample['features']  
-    learned_features = pfn(pillar_features)
-    print(f"PillarFeatureNet output shape: {learned_features.shape}")
+    # # Test Pillar Feature Network
+    # pfn = PillarFeatureNet(num_input_features=9, num_output_features=64)
+    # pillar_features = sample['features']  
+    # learned_features = pfn(pillar_features)
+    # print(f"PillarFeatureNet output shape: {learned_features.shape}")
 
-    # Test PsuedoScatter
-    scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
-    canvas = scatter(learned_features, sample['pillar_coords'])
-    print(f"PsuedoScatter output shape: {canvas.shape}")
-    # visualize_pseudo_image(canvas)
+    # # Test PsuedoScatter
+    # scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
+    # canvas = scatter(learned_features, sample['pillar_coords'])
+    # print(f"PsuedoScatter output shape: {canvas.shape}")
+    # # visualize_pseudo_image(canvas)
 
-    # Test backbone
-    backbone = Backbone()
-    backbone_output = backbone(canvas)
-    print(f"PointPillarsBackbone output shape: {backbone_output.shape}")
+    # # Test backbone
+    # backbone = Backbone()
+    # backbone_output = backbone(canvas)
+    # print(f"PointPillarsBackbone output shape: {backbone_output.shape}")
 
-    # Test detection head
-    detection_head = DetectionHead(in_channels=256, num_classes=train_dataset.num_classes, box_code_size=9)
-    box_preds, cls_preds = detection_head(backbone_output)
-    print(f"DetectionHead box_preds shape: {box_preds.shape}, cls_preds shape: {cls_preds.shape}")
+    # # Test detection head
+    # dh = DetectionHead(in_channels=256, num_classes=4, num_anchors_per_location=8, box_code_size=10)
+    # box_preds, cls_preds = dh(backbone_output)
+    # print(f"DetectionHead box_preds shape: {box_preds.shape}, cls_preds shape: {cls_preds.shape}")
 
-    # Test Anchor
-    anchor = Anchor(grid_size=grid_size)
-    # anchor.plot_anchors()
-    batch_results = anchor.assign(sample['annotations'])
-    anchor.visualize_matched_anchors(batch_results, sample['annotations'])
+    # # Test Anchor
+    # anchor = Anchor(grid_size=grid_size)
+    # # anchor.plot_anchors()
+    # # batch_results = anchor.assign(sample['annotations'])
+    # # anchor.visualize_matched_anchors(batch_results, sample['annotations'])
 
 
+    # Test whole PointPillars model
+    print("\n=== Testing PointPillarsModel ===")
+    model = PointPillarsModel(grid_size=grid_size, num_classes=4, grid_resolution=0.2)
+    model_output = model(sample)
+    print(f"PointPillarsModel output: {model_output.keys()}")
+    print(f"Box predictions shape: {model_output['box_preds'].shape}")
+    print(f"Class predictions shape: {model_output['cls_preds'].shape}")
+    print(f"Anchors shape: {model_output['anchors'].shape}")
 
-    # small_anchor = Anchor(grid_size=(2, 2))
-    # small_anchor.plot_anchors()  
+    compute_loss_example()
 
     # python -m src.models.PointPillars
 
