@@ -867,7 +867,7 @@ class Anchor():
             
             # 2. Assign high IoU anchors
             max_iou_per_anchor, best_gt_per_anchor = iou_matrix.max(dim=1)
-            high_iou_mask = (max_iou_per_anchor > 0.75) & (matched_gt_indices == -1)
+            high_iou_mask = (max_iou_per_anchor > 0.6) & (matched_gt_indices == -1)
             
             matched_gt_indices[high_iou_mask] = best_gt_per_anchor[high_iou_mask]
             matched_gt_boxes[high_iou_mask] = gt_boxes[best_gt_per_anchor[high_iou_mask]]
@@ -1132,33 +1132,33 @@ if __name__ == "__main__":
     sample = next(iter(data_loader))
     grid_size = (sample['grid_dims'][0], sample['grid_dims'][1])
     
-    # # Test Pillar Feature Network
-    # pfn = PillarFeatureNet(num_input_features=9, num_output_features=64)
-    # pillar_features = sample['features']  
-    # learned_features = pfn(pillar_features)
-    # print(f"PillarFeatureNet output shape: {learned_features.shape}")
+    # Test Pillar Feature Network
+    pfn = PillarFeatureNet(num_input_features=9, num_output_features=64)
+    pillar_features = sample['features']  
+    learned_features = pfn(pillar_features)
+    print(f"PillarFeatureNet output shape: {learned_features.shape}")
 
-    # # Test PsuedoScatter
-    # scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
-    # canvas = scatter(learned_features, sample['pillar_coords'])
-    # print(f"PsuedoScatter output shape: {canvas.shape}")
-    # # visualize_pseudo_image(canvas)
+    # Test PsuedoScatter
+    scatter = PsuedoScatter(num_input_features=64, grid_size_xy=grid_size)
+    canvas = scatter(learned_features, sample['pillar_coords'])
+    print(f"PsuedoScatter output shape: {canvas.shape}")
+    visualize_pseudo_image(canvas)
 
-    # # Test backbone
-    # backbone = Backbone()
-    # backbone_output = backbone(canvas)
-    # print(f"PointPillarsBackbone output shape: {backbone_output.shape}")
+    # Test backbone
+    backbone = Backbone()
+    backbone_output = backbone(canvas)
+    print(f"PointPillarsBackbone output shape: {backbone_output.shape}")
 
-    # # Test detection head
-    # dh = DetectionHead(in_channels=256, num_classes=4, num_anchors_per_location=8, box_code_size=10)
-    # box_preds, cls_preds = dh(backbone_output)
-    # print(f"DetectionHead box_preds shape: {box_preds.shape}, cls_preds shape: {cls_preds.shape}")
+    # Test detection head
+    dh = DetectionHead(in_channels=256, num_classes=4, num_anchors_per_location=8, box_code_size=10)
+    box_preds, cls_preds = dh(backbone_output)
+    print(f"DetectionHead box_preds shape: {box_preds.shape}, cls_preds shape: {cls_preds.shape}")
 
-    # # Test Anchor
-    # anchor = Anchor(grid_size=grid_size)
-    # # anchor.plot_anchors()
-    # # batch_results = anchor.assign(sample['annotations'])
-    # # anchor.visualize_matched_anchors(batch_results, sample['annotations'])
+    # Test Anchor
+    anchor = Anchor(grid_size=grid_size)
+    # anchor.plot_anchors()
+    batch_results = anchor.assign(sample['annotations'])
+    anchor.visualize_matched_anchors(batch_results, sample['annotations'])
 
 
     # Test whole PointPillars model
