@@ -536,6 +536,11 @@ class PointPillarsLoss(nn.Module):
         if num_positives == 0:
             return torch.tensor(0.0, device=box_preds.device), 0
         
+        # FIXED: Ensure all tensors are on the same device
+        positive_mask = positive_mask.to(box_preds.device)
+        matched_gt_boxes = matched_gt_boxes.to(box_preds.device)
+        anchors = anchors.to(box_preds.device)
+        
         # Get positive predictions and targets
         pos_box_preds = box_preds[positive_mask]
         pos_matched_gt = matched_gt_boxes[positive_mask]
@@ -558,7 +563,7 @@ class PointPillarsLoss(nn.Module):
             1.0, 1.0, 1.0,  # cx, cy, cz
             2.0, 2.0, 2.0,  # l, w, h (size more important)
             1.0, 1.0, 1.0, 1.0  # quaternion components
-        ], device=box_loss.device)
+        ], device=box_loss.device)  # FIXED: Ensure weights are on correct device
         
         weighted_box_loss = box_loss * box_weights.unsqueeze(0)
         
@@ -831,9 +836,10 @@ class Anchor():
         batch_results = {}
         
         for batch_idx in batch_indices:
-            # Initialize for current batch
-            matched_gt_indices = torch.full((num_anchors,), -1, dtype=torch.long)
-            matched_gt_boxes = torch.zeros((num_anchors, 10), dtype=torch.float32)
+            # FIXED: Initialize tensors on the same device as input boxes
+            device = boxes.device
+            matched_gt_indices = torch.full((num_anchors,), -1, dtype=torch.long, device=device)
+            matched_gt_boxes = torch.zeros((num_anchors, 10), dtype=torch.float32, device=device)
             
             # Filter boxes for current batch
             batch_mask = boxes[:, 10] == batch_idx
@@ -844,8 +850,11 @@ class Anchor():
                 batch_results[int(batch_idx.item())] = (matched_gt_indices, matched_gt_boxes)
                 continue
             
-            # Use 2D IoU instead of 3D
-            iou_matrix = self.calculate_2d_iou(gt_boxes)  # (num_anchors, num_gt)
+            # FIXED: Ensure anchors are on the same device
+            anchors_on_device = self.anchors.to(device)
+            
+            # Use 2D IoU instead of 3D (but with anchors on correct device)
+            iou_matrix = self.calculate_2d_iou_with_device(gt_boxes, anchors_on_device)
             
             # 1. Assign best anchor for each GT
             best_anchor_per_gt = iou_matrix.argmax(dim=0)
@@ -872,33 +881,26 @@ class Anchor():
 
             num_of_gt_boxes = gt_boxes.shape[0]
             num_of_matched_anchors = (matched_gt_indices >= 0).sum().item()
-            # print(f'Out of {num_of_gt_boxes} GT boxes, {num_of_matched_anchors} anchors matched in batch.')
-        
-        return batch_results
     
-    def calculate_2d_iou(self, gt_boxes):
+        return batch_results
+
+    def calculate_2d_iou_with_device(self, gt_boxes, anchors):
         """
-        Calculate 2D IoU between anchors and ground truth boxes.
-        Works with batched operations for efficiency.
-        
-        Args:
-            gt_boxes (torch.Tensor): GT boxes of shape (N, 10) - [cx,cy,cz,l,w,h,qw,qx,qy,qz]
-        
-        Returns:
-            torch.Tensor: IoU matrix of shape (num_anchors, N)
+        Calculate 2D IoU with proper device handling.
         """
-        num_anchors = self.anchors.shape[0]
+        num_anchors = anchors.shape[0]
         num_gt = gt_boxes.shape[0]
+        device = gt_boxes.device
         
         # Convert anchors and GT boxes to [x1, y1, x2, y2] format for IoU calculation
-        anchor_boxes = torch.zeros((num_anchors, 4), device=gt_boxes.device)
-        gt_boxes_2d = torch.zeros((num_gt, 4), device=gt_boxes.device)
+        anchor_boxes = torch.zeros((num_anchors, 4), device=device)
+        gt_boxes_2d = torch.zeros((num_gt, 4), device=device)
         
         # For anchors: [cx, cy, l, w] -> [x1, y1, x2, y2]
-        anchor_boxes[:, 0] = self.anchors[:, 0] - self.anchors[:, 3] / 2  # x1 = cx - l/2
-        anchor_boxes[:, 1] = self.anchors[:, 1] - self.anchors[:, 4] / 2  # y1 = cy - w/2
-        anchor_boxes[:, 2] = self.anchors[:, 0] + self.anchors[:, 3] / 2  # x2 = cx + l/2
-        anchor_boxes[:, 3] = self.anchors[:, 1] + self.anchors[:, 4] / 2  # y2 = cy + w/2
+        anchor_boxes[:, 0] = anchors[:, 0] - anchors[:, 3] / 2  # x1 = cx - l/2
+        anchor_boxes[:, 1] = anchors[:, 1] - anchors[:, 4] / 2  # y1 = cy - w/2
+        anchor_boxes[:, 2] = anchors[:, 0] + anchors[:, 3] / 2  # x2 = cx + l/2
+        anchor_boxes[:, 3] = anchors[:, 1] + anchors[:, 4] / 2  # y2 = cy + w/2
         
         # For GT boxes: [cx, cy, l, w] -> [x1, y1, x2, y2]
         gt_boxes_2d[:, 0] = gt_boxes[:, 0] - gt_boxes[:, 3] / 2  # x1 = cx - l/2
@@ -907,7 +909,6 @@ class Anchor():
         gt_boxes_2d[:, 3] = gt_boxes[:, 1] + gt_boxes[:, 4] / 2  # y2 = cy + w/2
         
         # Calculate IoU using torchvision's box_iou
-        # Returns tensor of shape (num_anchors, num_gt)
         iou_matrix = tv_ops.box_iou(anchor_boxes, gt_boxes_2d)
         
         return iou_matrix

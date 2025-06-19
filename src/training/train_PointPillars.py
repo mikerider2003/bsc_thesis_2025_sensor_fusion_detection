@@ -134,7 +134,15 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, loss, checkpoint
 def load_checkpoint(model, optimizer, scheduler, scaler, checkpoint_path, device):
     """Load model checkpoint."""
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        try:
+            # First try with weights_only=True (safer, but might fail with complex checkpoints)
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        except Exception as e:
+            print(f"Failed to load with weights_only=True: {e}")
+            print("Attempting to load with weights_only=False (less secure but compatible)")
+            # Fallback to weights_only=False for compatibility with older checkpoints
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
         model.load_state_dict(checkpoint['model_state_dict'])
         
         if optimizer and 'optimizer_state_dict' in checkpoint:
