@@ -487,6 +487,9 @@ class PointPillarsLoss(nn.Module):
         Compute multi-class focal loss with explicit background class.
         Uses softmax instead of sigmoid.
         """
+        # Move positive_mask to the same device as predictions
+        positive_mask = positive_mask.to(predictions.device)
+        
         num_classes = predictions.shape[1]
         
         # Convert targets to one-hot
@@ -685,9 +688,12 @@ class Anchor():
         anchors = []
         anchor_classes = []
         
-        # Convert grid centers to meters (0.2m per cell)
-        x_centers = (torch.arange(W, dtype=torch.float32) + 0.5) * self.grid_resolution
-        y_centers = (torch.arange(H, dtype=torch.float32) + 0.5) * self.grid_resolution
+        # FIXED: Match the coordinate system used in pillarization
+        max_range = (30, 20, 4)  # Should match your pillarization range
+        
+        # Convert grid centers to meters matching your pillar coordinate system
+        x_centers = (torch.arange(W, dtype=torch.float32) + 0.5) * self.grid_resolution - max_range[0]
+        y_centers = (torch.arange(H, dtype=torch.float32) + 0.5) * self.grid_resolution - max_range[1]
 
         for class_name, (l, w, h) in self.anchor_sizes.items():
             cz = h / 2
@@ -705,8 +711,8 @@ class Anchor():
                 block_anchors = torch.zeros((num_anchors, 10), dtype=torch.float32)
                 
                 # Fill anchor components
-                block_anchors[:, 0] = grid_x.reshape(-1)  # cx (meters)
-                block_anchors[:, 1] = grid_y.reshape(-1)  # cy (meters)
+                block_anchors[:, 0] = grid_x.reshape(-1)  # cx (meters, now in [-30, 30])
+                block_anchors[:, 1] = grid_y.reshape(-1)  # cy (meters, now in [-20, 20])
                 block_anchors[:, 2] = cz                  # cz (meters)
                 block_anchors[:, 3] = l                   # length (meters)
                 block_anchors[:, 4] = w                   # width (meters)
@@ -718,7 +724,7 @@ class Anchor():
                 
                 anchors.append(block_anchors)
                 anchor_classes.extend([class_name] * num_anchors)
-        
+    
         anchors = torch.cat(anchors, dim=0)
         return anchors, anchor_classes
     

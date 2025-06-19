@@ -133,9 +133,11 @@ class PointPillarsLoader(loader.ArgoDataset):
         non_zero = count_valid.squeeze(1) > 0
         centroid[non_zero] = sum_valid[non_zero] / count_valid[non_zero]
         
-        # Compute pillar centers (P, 2)
-        pc_x = pillar_coords[:, 0] * grid_size + grid_size/2
-        pc_y = (pillar_coords[:, 1] * grid_size) - (grid_dims[1] * grid_size/2) + grid_size/2
+        # FIXED: Compute pillar centers correctly
+        # Convert grid indices to real-world coordinates matching your range
+        max_range = (30, 20, 4)  # Should match pillarization range
+        pc_x = pillar_coords[:, 0] * grid_size - max_range[0] + grid_size/2  # Convert to [-30, 30]
+        pc_y = pillar_coords[:, 1] * grid_size - max_range[1] + grid_size/2  # Convert to [-20, 20]
         pillar_center = np.stack([pc_x, pc_y], axis=1)
         
         # Initialize enhanced features array (P, N, 9)
