@@ -12,8 +12,9 @@ from torch.utils.data.dataloader import default_collate
 
 
 class PointFusionloader(ArgoDataset):
-    def __init__(self, dataset_path, split='train', cameras=None, lidar=True, target_classes = {'PEDESTRIAN', 'TRUCK', 'LARGE_VEHICLE', 'REGULAR_VEHICLE'}, img_size=(388, 512)):
-        super().__init__(dataset_path, split, cameras, lidar, target_classes)
+    def __init__(self, dataset_path, split='train', img_size=(388, 512)):
+        super().__init__(dataset_path, split)
+        self.img_size = img_size  # Store for calibration adjustment
 
         self.processed_samples = []
         self._transform_image = T.Compose([
@@ -23,6 +24,14 @@ class PointFusionloader(ArgoDataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+
+        # Load intrinsics
+        intrinsics_path = os.path.join(sample['sequence_path'], 'calibration/intrinsics.feather')
+        intrinsics_df = feather.read_feather(intrinsics_path)
+
+        # Load extrinsics
+        extrinsics_path = os.path.join(sample['sequence_path'], 'calibration/egovehicle_SE3_sensor.feather')
+        extrinsics_df = feather.read_feather(extrinsics_path)
         
         # Load LiDAR point cloud
         lidar_data = feather.read_feather(sample['lidar_file'])
@@ -36,8 +45,10 @@ class PointFusionloader(ArgoDataset):
         for camera_name, image_id in sample['camera_frames'].items():
             img_path = os.path.join(sample['sequence_path'], f"sensors/cameras/{camera_name}/{image_id}.jpg")
             image = Image.open(img_path).convert('RGB')
-
             images[camera_name] = self._transform_image(image)
+        
+        # Process camera calibrations
+        camera_calibrations = self._process_camera_calibrations(intrinsics_df, extrinsics_df)
         
         # Process annotations
         annotations = self._process_annotations(sample['annotations'])
@@ -46,8 +57,7 @@ class PointFusionloader(ArgoDataset):
             'points': points,
             'images': images,
             'annotations': annotations,
-            'timestamp': sample['timestamp'],
-            'sequence_path': sample['sequence_path']
+            'camera_calibrations': camera_calibrations
         }
     
     def _random_sample_points(self, points, n_points=65536):
@@ -109,12 +119,134 @@ class PointFusionloader(ArgoDataset):
             'boxes': boxes_tensor,  # [N, 7] - x,y,z,l,w,h,heading
             'labels': labels_tensor  # [N]
         }
+    
+    def _process_camera_calibrations(self, intrinsics_df, extrinsics_df):
+        """
+        Process camera calibration data and adjust for image resizing.
+        """
+        calibrations = {}
+        
+        target_cameras = {
+            'ring_rear_left', 'ring_side_left', 'ring_front_left',
+            'ring_front_center', 'ring_front_right', 'ring_rear_right', 'ring_side_right'
+        }
+        
+        for _, intrinsic_row in intrinsics_df.iterrows():
+            camera_name = intrinsic_row['sensor_name']
+            
+            if camera_name not in target_cameras:
+                continue
+                
+            # Original image dimensions
+            original_height = int(intrinsic_row['height_px'])
+            original_width = int(intrinsic_row['width_px'])
+            
+            # Your resized dimensions (from img_size parameter)
+            resized_height, resized_width = self.img_size  # (388, 512)
+            
+            # Calculate scaling factors
+            scale_x = resized_width / original_width
+            scale_y = resized_height / original_height
+            
+            # Original intrinsic parameters
+            fx_original = intrinsic_row['fx_px']
+            fy_original = intrinsic_row['fy_px'] 
+            cx_original = intrinsic_row['cx_px']
+            cy_original = intrinsic_row['cy_px']
+            
+            # Scale intrinsic parameters for resized image
+            fx_scaled = fx_original * scale_x
+            fy_scaled = fy_original * scale_y
+            cx_scaled = cx_original * scale_x
+            cy_scaled = cy_original * scale_y
+            
+            # Create adjusted intrinsic matrix
+            intrinsic_matrix = torch.tensor([
+                [fx_scaled,  0, cx_scaled],
+                [ 0, fy_scaled, cy_scaled],
+                [ 0,  0,  1]
+            ], dtype=torch.float32)
+            
+            # Extrinsic matrix stays the same (world coordinates don't change)
+            extrinsic_row = extrinsics_df[extrinsics_df['sensor_name'] == camera_name]
+            
+            if len(extrinsic_row) > 0:
+                extrinsic_data = extrinsic_row.iloc[0]
+                
+                # Extract quaternion and translation
+                qw = extrinsic_data['qw']
+                qx = extrinsic_data['qx']
+                qy = extrinsic_data['qy']
+                qz = extrinsic_data['qz']
+                
+                tx = extrinsic_data['tx_m']
+                ty = extrinsic_data['ty_m']
+                tz = extrinsic_data['tz_m']
+                
+                # Convert quaternion to rotation matrix
+                rotation_matrix = self._quaternion_to_rotation_matrix(qw, qx, qy, qz)
+                
+                # Create 4x4 extrinsic matrix (world to camera transformation)
+                extrinsic_matrix = torch.eye(4, dtype=torch.float32)
+                extrinsic_matrix[:3, :3] = rotation_matrix
+                extrinsic_matrix[:3, 3] = torch.tensor([tx, ty, tz], dtype=torch.float32)
+                
+            else:
+                extrinsic_matrix = torch.eye(4, dtype=torch.float32)
+            
+            calibrations[camera_name] = {
+                'intrinsic': intrinsic_matrix,
+                'extrinsic': extrinsic_matrix,
+                'distortion': {
+                    'k1': intrinsic_row.get('k1', 0.0),
+                    'k2': intrinsic_row.get('k2', 0.0), 
+                    'k3': intrinsic_row.get('k3', 0.0)
+                },
+                'image_size': {
+                    'height': resized_height,
+                    'width': resized_width
+                },
+                'original_size': {
+                    'height': original_height,
+                    'width': original_width
+                },
+                'scale_factors': {
+                    'scale_x': scale_x,
+                    'scale_y': scale_y
+                }
+            }
+            
+        return calibrations
 
+    def _quaternion_to_rotation_matrix(self, qw, qx, qy, qz):
+        """
+        Convert quaternion to 3x3 rotation matrix.
+        
+        Args:
+            qw, qx, qy, qz: Quaternion components
+            
+        Returns:
+            torch.Tensor: 3x3 rotation matrix
+        """
+        # Normalize quaternion
+        norm = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
+        qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
+        
+        # Convert to rotation matrix
+        R = torch.tensor([
+            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
+            [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
+            [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
+        ], dtype=torch.float32)
+        
+        return R
+
+# Update custom_collate to handle camera_calibrations
 def custom_collate(batch):
     collated = {}
     for key in batch[0].keys():
-        if key == 'annotations':
-            # Keep annotations as a list of dictionaries
+        if key in ['annotations', 'camera_calibrations']:
+            # Keep these as lists since they can vary per sample
             collated[key] = [item[key] for item in batch]
         else:
             # Use default collate for other entries
@@ -226,19 +358,31 @@ if __name__ == "__main__":
     train_set = PointFusionloader(dataset_path, split='train')
     test_set = PointFusionloader(dataset_path, split='test')
 
-    # # Inspect the first sample
-    # sample = train_set[0]
+    # Inspect the first sample
+    sample = train_set[0]
 
-    # points = sample['points']
-    # images = sample['images']
-    # annotations = sample['annotations']
+    points = sample['points']
+    images = sample['images']
+    annotations = sample['annotations']
+    calibrations = sample['camera_calibrations']
 
-    # print(f"Points shape: {points.shape}")
-    # for camera_name, image in images.items():
-    #     print(f"Image {camera_name} shape: {image.shape}")
+    print(f"Points shape: {points.shape}")
     
-    # print(f"Annotations: \n\tBoxes shape: {annotations['boxes'].shape},\n\tLabels shape: {annotations['labels'].shape}")
+    print(f"\nCamera Calibrations:")
+    for camera_name, calib in calibrations.items():
+        print(f"\n{camera_name}:")
+        print(f"  Intrinsic matrix:\n{calib['intrinsic']}")
+        print(f"  Extrinsic matrix:\n{calib['extrinsic']}")
+        print(f"  Image size: {calib['image_size']}")
+        print(f"  Distortion: {calib['distortion']}")
+    
+    print(f"\nImages:")
+    for camera_name, image in images.items():
+        print(f"  {camera_name}: {image.shape}")
+    
+    print(f"\nAnnotations: \n\tBoxes shape: {annotations['boxes'].shape},\n\tLabels shape: {annotations['labels'].shape}")
 
+    # Optional: Remove the visualization calls for now to focus on calibration
     # plot_scene(points, annotations)
     # plot_images(images)
         
