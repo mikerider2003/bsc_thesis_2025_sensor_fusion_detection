@@ -259,7 +259,7 @@ class BoundingBoxExtractor(nn.Module):
             scores = pred['scores']
             boxes = pred['boxes']
             
-            keep = (scores > 0.5) & (torch.isin(labels, allowed_tensor))
+            keep = (scores > self.score_thresh) & (torch.isin(labels, allowed_tensor))
             
             filtered_preds.append({
                 'boxes': boxes[keep],
