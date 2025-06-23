@@ -9,11 +9,10 @@
         - [PointPillars (LiDAR Only)](#pointpillars-lidar-only)
     - [Multi-Modal](#multi-modal)
         - [PointFusion (Early Fusion)](#pointfusion-early-fusion)
-        - [AVOD (Late Fusion)](#avod-late-fusion)
 
 
 ## Introduction
-This project compares single-modal and multi-modal object detection methods for autonomous driving using the Argoverse2 dataset. It evaluates how well LiDAR-only, and fused sensor approaches (via early and late fusion strategies) detect objects like vehicles and pedestrians in diverse urban conditions. By using models such as PointPillars for LiDAR and fusion methods like PointFusion and AVOD, the study aims to quantify differences in accuracy, robustness, and inference speed, offering insights into effective sensor fusion strategies for safer autonomous systems.
+This project compares single-modal and multi-modal object detection methods for autonomous driving using the Argoverse2 dataset. It evaluates how well LiDAR-only, and fused sensor approach detect objects like vehicles and pedestrians in diverse urban conditions. By using models such as PointPillars for LiDAR and fusion methods like PointFusion, the study aims to quantify differences in accuracy, robustness, and inference speed, offering insights into effective sensor fusion strategies for safer autonomous systems.
 
 ## Dataset
 The Argoverse2 sensor dataset is a large-scale dataset designed for autonomous driving research. It includes high-resolution sensor data from various modalities, including LiDAR and cameras, collected in diverse urban environments.
@@ -70,55 +69,35 @@ chmod +x ./scripts/download_data.sh
 The dataset is pre-processed to extract relevant features and annotations for training and evaluation. 
 
 ## Methodology
-### Single-Modal:
-#### PointPillars (LiDAR Only)
-Due to unforeseen delays arising from extensive debugging, the model is still under development and may be subject to further modifications.
+### Single-Modal
+### PointPillars (LiDAR Only)
 
-PointPillars is a state of the art LiDAR-based object detection model that uses a unique pillar-based representation of point clouds. 
-
-##### Pre-processing
-- **Voxelization**: The point cloud is divided into pillars (2D grid cells) of fixed size (e.g., 0.3m x 0.3m)
-- **Feature Extraction**: Each pillar is represented by a fixed number of points (e.g., 100). Maximum amount of pillars per frame is fixed (e.g., 12000).
-    - In case of more or less pillars or points, the data is padded or truncated.
-
-The features for each point include:
-- (x, y, z): 3D coordinates
-- intensity: LiDAR intensity value
-- (x_c, y_c, z_c): center coordinates of the pillar
-- (x_p, y_p): normalized coordinates of the point within the pillar
-
-<!-- Add image here -->
-<!-- ![PointPillars Architecture](/src/utils/visualization/figures/Figure_1_zoom_1.png) -->
-<p align="center">
-    <img src="./src/utils/visualization/figures/Figure_1_zoom_1.png" alt="Pillars Voxalization" width="600"/>
-    <br>
-    Example of voxelizated point cloud with pillars, point and annotations
-</p>
-
-##### Architecture
-1. Pillar Feature Encoder (PillarFeatureNet)
-   - Input: [P, N, 9]
-     - P: number of non-empty pillars
-     - N: number of points per pillar (fixed, e.g. 100)
+#### Architecture
+1. **Pillar Feature Encoder (PillarFeatureNet)**
+   - Input: [P, N, 9] where:
+     - P = number of non-empty pillars
+     - N = points per pillar (fixed at 100)
      - 9 features per point: [x, y, z, intensity, x_c, y_c, z_c, x_p, y_p]
-   - Output: [P, C]
-     - A feature vector per pillar (typically C = 64)
+   - Output: [P, C] feature vectors (typically C = 64)
 
-2. Pseudo-Image Scattering
-   - Each pillar feature is placed into its (x_idx, y_idx) location in a 2D canvas of shape [C, H, W]
-   - Uses `coords = [batch_idx, x_idx, y_idx]` to determine location
+2. **Pseudo-Image Scattering**
+   - Places pillar features into 2D canvas [C, H, W]
+   - Uses coordinates: [batch_idx, x_idx, y_idx]
 
-3. 2D CNN Backbone (Backbone2D)
-   - Takes the pseudo-image [B, C, H, W]
-   - Applies convolutional layers (with strides) followed by deconvolutions
-   - Produces a high-level spatial feature map: [B, 6C, H, W]
+3. **2D CNN Backbone**
+   - Processes pseudo-image [B, C, H, W]
+   - Outputs high-level features: [B, 6C, H, W]
 
-4. SSD Detection Head (SSDDetectionHead)
-   - Operates on the output of the 2D backbone
+4. **SSD Detection Head**
    - Predicts:
      - Class scores: [num_anchors * num_classes]
      - Box regression: [num_anchors * 7] → (x, y, z, w, l, h, θ)
-     - Orientation classification: [num_anchors * 2]
+     - Orientation: [num_anchors * 2]
+
+#### Key Components
+- Pillarization of 3D point clouds
+- Efficient 2D convolutions on pillar features
+- Anchor-based detection
 
 ##### Key Files
 - `/src/loaders/loader_Point_Pillars.py`: Handles the data loading and preprocessing for PointPillars, including the pillarization process
@@ -126,18 +105,32 @@ The features for each point include:
 - `/src/models/PointPillars.py`: Will contain the model architecture implementation (currently empty, to be implemented)
 - `/scripts/run_train_pointpillars.sh`: Will be used for training the PointPillars model (currently empty, to be implemented)
 
+### PointFusion (Early Fusion)
+#### Architecture
+1. **2D Object Detection**
+   - Faster R-CNN with ResNet-50 backbone
+   - Processes 7 ring camera images
+   - Confidence threshold: 0.9
 
-### Multi-Modal
-#### PointFusion (Early Fusion)
-Due to unforeseen delays arising from extensive debugging, the model is still under development and may be subject to further modifications.
+2. **LiDAR-Camera Alignment**
+   - Projects LiDAR points to 2D using calibration matrices
+   - Filters points beyond 40m
 
-- **Early Fusion**: Combines LiDAR and camera data at the feature level before feeding it into the neural network.
-- **Feature Extraction**: Extracts features from both LiDAR and camera data.
-- **Fusion Layer**: Merges the features from both modalities.
-- **Detection Head**: Processes the fused features to predict bounding boxes and class scores.
-- **Loss Function**: Combines classification and regression losses for training.
+3. **Feature Extraction**
+   - Image branch: CNN with adaptive pooling
+   - LiDAR branch: PointNet-style MLP with max pooling
 
+4. **Multi-Modal Fusion**
+    - Early fusion of image and LiDAR features
+    - Joint classification and regression heads
 
+#### Key Components
+- Early fusion of modalities
+- Cross-sensor calibration
+- Joint classification and regression
 
-#### AVOD (Late Fusion)
-Due to unforeseen delays caused by extensive debugging of the preceding two models, the implementation of this model is still pending.
+##### Key Files
+- `/src/loaders/loader_Point_Fusion.py`: Handles the data loading and preprocessing for PointFusion
+- `/src/models/PointFusion.py`: Contains the model architecture implementation
+- `/scripts/run_train_pointfusion.sh`: Is used for training the PointFusion model
+
