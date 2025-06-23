@@ -416,9 +416,13 @@ if __name__ == "__main__":
     elif os.path.exists(train_data_path) and os.path.exists(val_data_path):
         print("Loading existing preprocessed data...")
         train_preprocessor = Preprocessor(load_path=train_data_path)
-        val_preprocessor = Preprocessor(load_path=val_data_path)
         train_preprocessor.assign_gt()
+        train_preprocessor.save_processed_data(save_path=train_data_path_improved)
+
+        val_preprocessor = Preprocessor(load_path=val_data_path)
         val_preprocessor.assign_gt()
+        val_preprocessor.save_processed_data(save_path=val_data_path_improved)
+
     else:
         print("Creating new preprocessed data...")
         # Load and split dataset
