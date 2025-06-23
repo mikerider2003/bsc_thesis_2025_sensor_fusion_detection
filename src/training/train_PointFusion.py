@@ -1,613 +1,527 @@
 # src/training/train_PointFusion.py
 import torch
+import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import os
+import numpy as np
 from dotenv import load_dotenv
 import torch.nn.functional as F
-import wandb
 from datetime import datetime
+import matplotlib.pyplot as plt
 
-from src.loaders.loader_Point_Fusion import PointFusionloader, custom_collate
-from src.models.PointFusion import PointFusion, MeanAveragePrecision3D, BoundingBoxExtractor, Allocate3dPoints
+from src.loaders.loader_Point_Fusion import PointFusionloader
+from src.models.PointFusion import Preprocessor, PointFusion
 
-class PointFusionTrainer:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
-        
-        # Initialize models
-        self.model = PointFusion(
-            num_classes=config['num_classes'],
-            point_feature_dim=config['point_feature_dim'],
-            img_feature_dim=config['img_feature_dim']
-        ).to(self.device)
-        
-        # Fix: Move BoundingBoxExtractor to device
-        self.bbox_extractor = BoundingBoxExtractor(score_thresh=config['bbox_score_thresh']).to(self.device)
-        
-        # Fix: Move Allocate3dPoints to device  
-        self.point_allocator = Allocate3dPoints(
-            max_points_per_box=config['max_points_per_box'],
-            min_points_per_box=config.get('min_points_per_box', 10)
-        ).to(self.device)
-        
-        # Initialize optimizer
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=config['learning_rate'],
-            weight_decay=config['weight_decay']
-        )
-        
-        # Initialize scheduler
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer,
-            step_size=config['scheduler_step'],
-            gamma=config['scheduler_gamma']
-        )
-        
-        # Initialize metrics
-        self.train_map = MeanAveragePrecision3D(config['num_classes'], iou_threshold=0.5)
-        self.val_map = MeanAveragePrecision3D(config['num_classes'], iou_threshold=0.5)
-        
-        # Training history
-        self.train_losses = []
-        self.val_losses = []
-        self.val_maps = []
-        
-    def compute_iou_3d_simple(self, pred_box, gt_box):
-        """
-        Simplified 3D IoU calculation for box matching
-        Both boxes in format [x, y, z, l, w, h, heading]
-        """
-        # Extract centers and dimensions
-        pred_center = pred_box[:3]
-        pred_dims = pred_box[3:6]
-        
-        gt_center = gt_box[:3]
-        gt_dims = gt_box[3:6]
-        
-        # Calculate axis-aligned bounding boxes (ignore rotation for simplicity)
-        pred_min = pred_center - pred_dims / 2
-        pred_max = pred_center + pred_dims / 2
-        
-        gt_min = gt_center - gt_dims / 2
-        gt_max = gt_center + gt_dims / 2
-        
-        # Intersection
-        inter_min = torch.maximum(pred_min, gt_min)
-        inter_max = torch.minimum(pred_max, gt_max)
-        inter_dims = torch.clamp(inter_max - inter_min, min=0)
-        inter_vol = inter_dims[0] * inter_dims[1] * inter_dims[2]
-        
-        # Union
-        pred_vol = pred_dims[0] * pred_dims[1] * pred_dims[2]
-        gt_vol = gt_dims[0] * gt_dims[1] * gt_dims[2]
-        union_vol = pred_vol + gt_vol - inter_vol
-        
-        return inter_vol / (union_vol + 1e-8)
 
-    def find_best_gt_match(self, obj, gt_boxes, gt_labels):
-        """
-        Find the best ground truth match for a prediction using multiple criteria
-        """
-        if len(gt_boxes) == 0:
-            return None, None, 0.0
+class PointFusionDataset(Dataset):
+    """Dataset wrapper for preprocessed PointFusion data"""
+    def __init__(self, preprocessor):
+        self.rolls = preprocessor.rolls
+        self.point_clouds = preprocessor.point_clouds
+        self.labels = preprocessor.labels
+        self.annotations = preprocessor.annotations
         
-        points = obj['points']
-        if len(points) == 0:
-            return None, None, 0.0
-        
-        # Method 1: Centroid distance
-        center_pred = torch.mean(points, dim=0)
-        gt_centers = gt_boxes[:, :3]
-        distances = torch.norm(gt_centers - center_pred.unsqueeze(0), dim=1)
-        
-        # Method 2: IoU with predicted box (if we have a reasonable prediction)
-        pred_box = obj['box_3d']
-        ious = torch.zeros(len(gt_boxes), device=self.device)
-        
-        for i, gt_box in enumerate(gt_boxes):
-            try:
-                iou = self.compute_iou_3d_simple(pred_box, gt_box)
-                ious[i] = iou
-            except:
-                ious[i] = 0.0
-        
-        # Combine criteria: prioritize IoU if > threshold, otherwise use distance
-        iou_threshold = 0.1
-        distance_threshold = self.config.get('matching_distance_threshold', 5.0)
-        
-        # Find best IoU match
-        best_iou, best_iou_idx = torch.max(ious, dim=0)
-        
-        # Find best distance match
-        min_distance, best_dist_idx = torch.min(distances, dim=0)
-        
-        if best_iou > iou_threshold:
-            # Use IoU-based matching if we have a good overlap
-            return gt_boxes[best_iou_idx], gt_labels[best_iou_idx], best_iou.item()
-        elif min_distance < distance_threshold:
-            # Fall back to distance-based matching
-            return gt_boxes[best_dist_idx], gt_labels[best_dist_idx], min_distance.item()
-        else:
-            # No good match found
-            return None, None, min_distance.item()
-
-    def compute_loss(self, predictions, ground_truths):
-        """
-        Compute combined classification and regression loss with improved GT matching
-        """
-        total_loss = 0.0
-        cls_loss_total = 0.0
-        reg_loss_total = 0.0
-        num_objects = 0
-        num_matched = 0
-        num_unmatched = 0
-        
-        matching_stats = {'iou_matches': 0, 'distance_matches': 0, 'no_matches': 0}
-        
-        # Process each camera's predictions
-        for camera_name, camera_preds in predictions.items():
-            for batch_idx, batch_preds in enumerate(camera_preds):
-                if len(batch_preds) == 0:
-                    continue
-                
-                # Ensure we have valid ground truth for this batch
-                if batch_idx >= len(ground_truths):
-                    continue
-                    
-                # Get corresponding ground truth
-                gt = ground_truths[batch_idx]
-                gt_boxes = gt['boxes'].to(self.device)
-                gt_labels = gt['labels'].to(self.device)
-                
-                if len(gt_boxes) == 0:
-                    continue
-                
-                for obj in batch_preds:
-                    if 'class' not in obj or 'box_3d' not in obj or 'points' not in obj:
-                        continue
-                    
-                    # Check for valid tensors
-                    if torch.isnan(obj['class']).any() or torch.isnan(obj['box_3d']).any():
-                        continue
-                    
-                    try:
-                        # Find best ground truth match
-                        target_box, target_label, match_quality = self.find_best_gt_match(
-                            obj, gt_boxes, gt_labels
-                        )
-                        
-                        if target_box is not None:
-                            # Valid match found
-                            cls_pred = obj['class']
-                            cls_loss = F.cross_entropy(cls_pred.unsqueeze(0), target_label.unsqueeze(0))
-                            
-                            if not (torch.isnan(cls_loss) or torch.isinf(cls_loss)):
-                                cls_loss_total += cls_loss
-                                
-                                # Regression loss with matched target
-                                reg_pred = obj['box_3d']
-                                if reg_pred.shape[0] == target_box.shape[0]:
-                                    reg_loss = F.mse_loss(reg_pred, target_box)
-                                    
-                                    if not (torch.isnan(reg_loss) or torch.isinf(reg_loss)):
-                                        reg_loss_total += reg_loss
-                                        num_matched += 1
-                                        
-                                        # Track matching method
-                                        if match_quality > 0.1:  # IoU-based
-                                            matching_stats['iou_matches'] += 1
-                                        else:  # Distance-based
-                                            matching_stats['distance_matches'] += 1
-                                
-                                num_objects += 1
-                        else:
-                            # No valid match
-                            matching_stats['no_matches'] += 1
-                            num_unmatched += 1
-                            
-                    except Exception as e:
-                        print(f"Error in loss computation for object: {e}")
-                        continue
-        
-        if num_objects > 0:
-            cls_loss_avg = cls_loss_total / num_objects
-            reg_loss_avg = reg_loss_total / max(num_matched, 1)
-            total_loss = cls_loss_avg + self.config['reg_loss_weight'] * reg_loss_avg
-        else:
-            # Create tensors on the correct device
-            total_loss = torch.tensor(0.001, requires_grad=True, device=self.device)
-            cls_loss_avg = torch.tensor(0.0, device=self.device)
-            reg_loss_avg = torch.tensor(0.0, device=self.device)
-        
-        # Print detailed matching statistics
-        if hasattr(self, '_loss_call_count'):
-            self._loss_call_count += 1
-        else:
-            self._loss_call_count = 1
-            
-        if self._loss_call_count % 100 == 0:
-            print(f"Matching stats: IoU={matching_stats['iou_matches']}, "
-                  f"Distance={matching_stats['distance_matches']}, "
-                  f"No match={matching_stats['no_matches']}, "
-                  f"Total predictions={num_objects + num_unmatched}")
-            
-        return total_loss, cls_loss_avg, reg_loss_avg
-
-    def _map_2d_to_3d_label(self, label_2d):
-        """Map 2D detection labels to 3D class indices"""
-        mapping = {
-            1: 0,  # person -> PEDESTRIAN
-            3: 1,  # car -> REGULAR_VEHICLE
-            6: 2,  # bus -> LARGE_VEHICLE
-            8: 3   # truck -> TRUCK
+        # Create label mapping
+        self.label_to_idx = {
+            'PEDESTRIAN': 0,
+            'REGULAR_VEHICLE': 1,
+            'LARGE_VEHICLE': 2,
+            'TRUCK': 3
         }
-        return mapping.get(label_2d, 0)  # Default to PEDESTRIAN
+        
+    def __len__(self):
+        return len(self.rolls)
     
-    def process_batch(self, batch):
-        """Process a batch through the entire pipeline"""
-        # Move data to device
-        batch['points'] = batch['points'].to(self.device)
-        for camera_name in batch['images'].keys():
-            batch['images'][camera_name] = batch['images'][camera_name].to(self.device)
+    def __getitem__(self, idx):
+        # Get data
+        roll = self.rolls[idx]  # [3, 224, 224]
+        point_cloud = self.point_clouds[idx]  # [N, 3] or [max_points, 3]
+        label = self.labels[idx]  # string
+        annotation = self.annotations[idx]  # dict with 'boxes' and 'labels'
         
-        # Move camera calibrations to device
-        for batch_idx in range(len(batch['camera_calibrations'])):
-            for camera_name in batch['camera_calibrations'][batch_idx].keys():
-                batch['camera_calibrations'][batch_idx][camera_name]['intrinsic'] = \
-                    batch['camera_calibrations'][batch_idx][camera_name]['intrinsic'].to(self.device)
-                batch['camera_calibrations'][batch_idx][camera_name]['extrinsic'] = \
-                    batch['camera_calibrations'][batch_idx][camera_name]['extrinsic'].to(self.device)
+        # Convert label to index
+        label_idx = self.label_to_idx.get(label, 0)
         
-        # Extract 2D bounding boxes (now both model and data are on same device)
-        all_camera_detections = {}
-        for camera_name, images in batch['images'].items():
-            with torch.no_grad():
-                detections = self.bbox_extractor(images)
-            all_camera_detections[camera_name] = detections
+        # Ensure point cloud has consistent shape (pad or truncate to 400 points)
+        max_points = 400
+        if len(point_cloud) == 0:
+            # Empty point cloud - fill with zeros
+            point_cloud = torch.zeros(max_points, 3)
+        elif len(point_cloud) < max_points:
+            # Pad with zeros if too few points
+            padding = torch.zeros(max_points - len(point_cloud), 3)
+            point_cloud = torch.cat([point_cloud, padding], dim=0)
+        elif len(point_cloud) > max_points:
+            # Randomly sample if too many points
+            indices = torch.randperm(len(point_cloud))[:max_points]
+            point_cloud = point_cloud[indices]
         
-        batch['detections'] = all_camera_detections
+        return {
+            'image': roll.float(),
+            'point_cloud': point_cloud.float(),
+            'label': torch.tensor(label_idx, dtype=torch.long),
+            'annotation': annotation
+        }
+
+
+class PointFusionLoss(nn.Module):
+    """
+    Loss function for PointFusion model. 
+    Matches center of point_clouds to closest annotations['boxes'] then computes classification and regression loss.
+    """
+    def __init__(self, alpha=1.0, beta=10.0, gamma=1.0):
+        super().__init__()
+        self.alpha = alpha  # Weight for classification loss
+        self.beta = beta   # Weight for regression loss  
+        self.gamma = gamma # Weight for confidence loss
         
-        # Allocate 3D points to 2D boxes (now all on same device)
-        with torch.no_grad():
-            allocated_points = self.point_allocator(
-                batch['detections'], 
-                batch['points'], 
-                batch['camera_calibrations']
-            )
+        # Loss functions
+        self.classification_loss = nn.CrossEntropyLoss()
+        self.regression_loss = nn.SmoothL1Loss()
+        self.confidence_loss = nn.BCELoss()
         
-        batch['allocated_points'] = allocated_points
+    def compute_point_cloud_center(self, point_clouds):
+        """
+        Compute center of point clouds
+        Args:
+            point_clouds: [B, N, 3] tensor of point clouds
+        Returns:
+            centers: [B, 3] tensor of centers
+        """
+        centers = []
+        for pc in point_clouds:
+            # Remove zero-padded points
+            valid_mask = torch.any(pc != 0, dim=1)
+            valid_points = pc[valid_mask]
+            
+            if len(valid_points) > 0:
+                center = torch.mean(valid_points, dim=0)  # [3]
+            else:
+                center = torch.zeros(3, device=pc.device)
+            centers.append(center)
         
-        # Forward pass through PointFusion
-        predictions = self.model(batch)
-        
-        return predictions
+        return torch.stack(centers)  # [B, 3]
     
-    def train_epoch(self, train_loader):
-        """Train for one epoch"""
-        self.model.train()
-        epoch_loss = 0.0
-        epoch_cls_loss = 0.0
-        epoch_reg_loss = 0.0
-        num_batches = 0
-        successful_batches = 0
+    def match_predictions_to_gt(self, pred_centers, annotations):
+        """
+        Match predicted centers to closest ground truth boxes
+        Args:
+            pred_centers: [B, 3] tensor of predicted centers
+            annotations: list of annotation dicts for each batch item
+        Returns:
+            matched_gt_boxes: [B, 7] tensor of matched GT boxes (x,y,z,l,w,h,heading)
+            matched_gt_labels: [B] tensor of matched GT labels  
+            valid_matches: [B] tensor indicating which predictions have valid matches
+        """
+        batch_size = len(pred_centers)
+        matched_gt_boxes = torch.zeros(batch_size, 7, device=pred_centers.device)
+        matched_gt_labels = torch.zeros(batch_size, dtype=torch.long, device=pred_centers.device)
+        valid_matches = torch.zeros(batch_size, dtype=torch.bool, device=pred_centers.device)
         
-        # Reset metrics
-        self.train_map.reset()
+        label_to_idx = {
+            'PEDESTRIAN': 0,
+            'REGULAR_VEHICLE': 1, 
+            'LARGE_VEHICLE': 2,
+            'TRUCK': 3
+        }
         
-        progress_bar = tqdm(train_loader, desc="Training", leave=False)
-        
-        for batch in progress_bar:
-            try:
-                self.optimizer.zero_grad()
-                
-                # Process batch
-                predictions = self.process_batch(batch)
-                
-                # Check if we have any predictions
-                total_predictions = sum(len(camera_preds) for camera_preds in predictions.values() 
-                                      for camera_preds in camera_preds)
-                
-                if total_predictions == 0:
-                    print("No predictions in batch, skipping...")
-                    continue
-                
-                # Compute loss
-                loss, cls_loss, reg_loss = self.compute_loss(predictions, batch['annotations'])
-                
-                # Backward pass
-                if loss.requires_grad and loss.item() > 0:
-                    loss.backward()
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    
-                    self.optimizer.step()
-                    successful_batches += 1
-                
-                # Update metrics (only if we have valid predictions)
-                try:
-                    self.train_map.add_batch(predictions, batch['annotations'])
-                except Exception as e:
-                    print(f"Error updating metrics: {e}")
-                
-                # Accumulate losses
-                epoch_loss += loss.item()
-                epoch_cls_loss += cls_loss.item() if hasattr(cls_loss, 'item') else float(cls_loss)
-                epoch_reg_loss += reg_loss.item() if hasattr(reg_loss, 'item') else float(reg_loss)
-                num_batches += 1
-                
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'Loss': f"{loss.item():.4f}",
-                    'Cls': f"{cls_loss.item() if hasattr(cls_loss, 'item') else cls_loss:.4f}",
-                    'Reg': f"{reg_loss.item() if hasattr(reg_loss, 'item') else reg_loss:.4f}",
-                    'Success': f"{successful_batches}/{num_batches}"
-                })
-                
-            except Exception as e:
-                print(f"Error in training batch: {e}")
-                import traceback
-                traceback.print_exc()
+        for b in range(batch_size):
+            pred_center = pred_centers[b]  # [3]
+            annotation = annotations[b]
+            
+            if annotation['boxes'].shape[0] == 0:
+                # No ground truth boxes for this sample
+                raise ValueError(f"No ground truth boxes for batch index {b}")
                 continue
-        
-        # Compute epoch metrics
-        avg_loss = epoch_loss / max(num_batches, 1)
-        avg_cls_loss = epoch_cls_loss / max(num_batches, 1)
-        avg_reg_loss = epoch_reg_loss / max(num_batches, 1)
-        
-        try:
-            train_map_score = self.train_map.compute()
-        except Exception as e:
-            print(f"Error computing training mAP: {e}")
-            train_map_score = 0.0
-        
-        print(f"Successful batches: {successful_batches}/{num_batches}")
-        return avg_loss, avg_cls_loss, avg_reg_loss, train_map_score
+                
+            gt_boxes = annotation['boxes']  # [N_gt, 7] 
+            gt_labels = annotation['labels']  # [N_gt]
+            
+            # Compute distances from predicted center to all GT box centers
+            gt_centers = gt_boxes[:, :3]  # [N_gt, 3] - x,y,z coordinates
+            distances = torch.norm(pred_center.unsqueeze(0) - gt_centers, dim=1)  # [N_gt]
+            
+            # Find closest GT box
+            closest_idx = torch.argmin(distances)
+            
+            # Set matched values
+            matched_gt_boxes[b] = gt_boxes[closest_idx]
+            
+            # Convert string label to index
+            gt_label_str = gt_labels[closest_idx]
+            matched_gt_labels[b] = label_to_idx.get(gt_label_str, 0)
+            valid_matches[b] = True
+            
+        return matched_gt_boxes, matched_gt_labels, valid_matches
     
-    def validate_epoch(self, val_loader):
-        """Validate for one epoch"""
-        self.model.eval()
-        epoch_loss = 0.0
-        epoch_cls_loss = 0.0
-        epoch_reg_loss = 0.0
-        num_batches = 0
+    def forward(self, predictions, point_clouds, annotations):
+        """
+        Compute loss for PointFusion predictions
+        Args:
+            predictions: dict with 'cls_scores', 'bbox_pred', 'confidence'
+            point_clouds: [B, N, 3] tensor of point clouds
+            annotations: list of annotation dicts
+        Returns:
+            total_loss: scalar loss value
+            loss_dict: dict with individual loss components
+        """
+        # Extract predictions
+        cls_scores = predictions['cls_scores']  # [B, num_classes]
+        bbox_pred = predictions['bbox_pred']    # [B, 7]
+        confidence = predictions['confidence']  # [B, 1]
         
-        # Reset metrics
-        self.val_map.reset()
+        # Compute point cloud centers
+        pred_centers = self.compute_point_cloud_center(point_clouds)
         
-        progress_bar = tqdm(val_loader, desc="Validation", leave=False)
+        # Match predictions to ground truth
+        matched_gt_boxes, matched_gt_labels, valid_matches = self.match_predictions_to_gt(
+            pred_centers, annotations
+        )
         
-        with torch.no_grad():
-            for batch in progress_bar:
-                try:
-                    # Process batch
-                    predictions = self.process_batch(batch)
-                    
-                    # Compute loss
-                    loss, cls_loss, reg_loss = self.compute_loss(predictions, batch['annotations'])
-                    
-                    # Update metrics
-                    self.val_map.add_batch(predictions, batch['annotations'])
-                    
-                    # Accumulate losses
-                    epoch_loss += loss.item()
-                    epoch_cls_loss += cls_loss.item() if hasattr(cls_loss, 'item') else cls_loss
-                    epoch_reg_loss += reg_loss.item() if hasattr(reg_loss, 'item') else reg_loss
-                    num_batches += 1
-                    
-                    # Update progress bar
-                    progress_bar.set_postfix({
-                        'Val Loss': f"{loss.item():.4f}",
-                        'Cls': f"{cls_loss.item() if hasattr(cls_loss, 'item') else cls_loss:.4f}",
-                        'Reg': f"{reg_loss.item() if hasattr(reg_loss, 'item') else reg_loss:.4f}"
-                    })
-                    
-                except Exception as e:
-                    print(f"Error in validation batch: {e}")
-                    continue
+        # Only compute loss for valid matches
+        if not valid_matches.any():
+            # No valid matches - return zero loss
+            total_loss = torch.tensor(0.0, device=cls_scores.device, requires_grad=True)
+            return total_loss, {'cls_loss': 0.0, 'reg_loss': 0.0, 'conf_loss': 0.0}
         
-        # Compute epoch metrics
-        avg_loss = epoch_loss / max(num_batches, 1)
-        avg_cls_loss = epoch_cls_loss / max(num_batches, 1)
-        avg_reg_loss = epoch_reg_loss / max(num_batches, 1)
-        val_map_score = self.val_map.compute()
+        # Filter to only valid matches
+        valid_cls_scores = cls_scores[valid_matches]
+        valid_bbox_pred = bbox_pred[valid_matches]
+        valid_confidence = confidence[valid_matches]
+        valid_gt_boxes = matched_gt_boxes[valid_matches]
+        valid_gt_labels = matched_gt_labels[valid_matches]
         
-        return avg_loss, avg_cls_loss, avg_reg_loss, val_map_score
-    
-    def save_checkpoint(self, epoch, val_loss, is_best=False):
-        """Save model checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'val_loss': val_loss,
-            'config': self.config,
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'val_maps': self.val_maps
+        # Classification loss
+        cls_loss = self.classification_loss(valid_cls_scores, valid_gt_labels)
+        
+        # Regression loss (for box parameters)
+        reg_loss = self.regression_loss(valid_bbox_pred, valid_gt_boxes)
+        
+        # Confidence loss (high confidence for good matches)
+        # Use IoU or distance-based confidence targets
+        target_confidence = torch.ones_like(valid_confidence)  # High confidence for matched predictions
+        conf_loss = self.confidence_loss(valid_confidence, target_confidence)
+        
+        # Combine losses
+        total_loss = (self.alpha * cls_loss + 
+                     self.beta * reg_loss + 
+                     self.gamma * conf_loss)
+        
+        loss_dict = {
+            'cls_loss': cls_loss.item(),
+            'reg_loss': reg_loss.item(), 
+            'conf_loss': conf_loss.item(),
+            'total_loss': total_loss.item()
         }
         
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(self.config['save_dir'], f'checkpoint_epoch_{epoch}.pth')
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best model
-        if is_best:
-            best_path = os.path.join(self.config['save_dir'], 'best_model.pth')
-            torch.save(checkpoint, best_path)
-            print(f"New best model saved with mAP: {self.val_maps[-1]:.4f}")
+        return total_loss, loss_dict
+
+
+def collate_fn(batch):
+    """Custom collate function for PointFusion data"""
+    images = torch.stack([item['image'] for item in batch])
+    point_clouds = torch.stack([item['point_cloud'] for item in batch])
+    labels = torch.stack([item['label'] for item in batch])
+    annotations = [item['annotation'] for item in batch]
     
-    def train(self, train_loader, val_loader):
-        """Main training loop"""
-        print(f"Starting training for {self.config['epochs']} epochs")
-        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+    return {
+        'images': images,
+        'point_clouds': point_clouds,
+        'labels': labels,
+        'annotations': annotations
+    }
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+    loss_components = {'cls_loss': 0.0, 'reg_loss': 0.0, 'conf_loss': 0.0}
+    
+    pbar = tqdm(dataloader, desc="Training")
+    for batch in pbar:
+        # Move to device
+        images = batch['images'].to(device)
+        point_clouds = batch['point_clouds'].to(device)
+        annotations = batch['annotations']
         
-        best_val_map = 0.0
+        # Forward pass
+        optimizer.zero_grad()
+        predictions = model(images, point_clouds)
         
-        for epoch in range(self.config['epochs']):
-            print(f"\nEpoch {epoch+1}/{self.config['epochs']}")
-            print("-" * 50)
-            
-            # Training
-            train_loss, train_cls_loss, train_reg_loss, train_map = self.train_epoch(train_loader)
-            
-            # Validation
-            val_loss, val_cls_loss, val_reg_loss, val_map = self.validate_epoch(val_loader)
-            
-            # Update scheduler
-            self.scheduler.step()
-            
-            # Store metrics
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.val_maps.append(val_map)
-            
-            # Print epoch results
-            print(f"Train - Loss: {train_loss:.4f}, Cls: {train_cls_loss:.4f}, Reg: {train_reg_loss:.4f}, mAP: {train_map:.4f}")
-            print(f"Val   - Loss: {val_loss:.4f}, Cls: {val_cls_loss:.4f}, Reg: {val_reg_loss:.4f}, mAP: {val_map:.4f}")
-            print(f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
-            
-            # Log to wandb if available
-            if self.config.get('use_wandb', False):
-                wandb.log({
-                    'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    'train_cls_loss': train_cls_loss,
-                    'train_reg_loss': train_reg_loss,
-                    'train_map': train_map,
-                    'val_loss': val_loss,
-                    'val_cls_loss': val_cls_loss,
-                    'val_reg_loss': val_reg_loss,
-                    'val_map': val_map,
-                    'learning_rate': self.optimizer.param_groups[0]['lr']
-                })
-            
-            # Save checkpoint
-            is_best = val_map > best_val_map
-            if is_best:
-                best_val_map = val_map
-            
-            if (epoch + 1) % self.config['save_every'] == 0 or is_best:
-                self.save_checkpoint(epoch + 1, val_loss, is_best)
+        # Compute loss
+        loss, loss_dict = criterion(predictions, point_clouds, annotations)
         
-        print(f"\nTraining completed! Best validation mAP: {best_val_map:.4f}")
-        return self.train_losses, self.val_losses, self.val_maps
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Accumulate metrics
+        batch_size = len(images)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+        
+        for key in loss_components:
+            if key in loss_dict:
+                loss_components[key] += loss_dict[key] * batch_size
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'cls': f"{loss_dict.get('cls_loss', 0):.4f}",
+            'reg': f"{loss_dict.get('reg_loss', 0):.4f}",
+            'conf': f"{loss_dict.get('conf_loss', 0):.4f}"
+        })
+    
+    # Average losses
+    avg_loss = total_loss / total_samples
+    for key in loss_components:
+        loss_components[key] /= total_samples
+    
+    return avg_loss, loss_components
+
+
+def validate_epoch(model, dataloader, criterion, device):
+    """Validate for one epoch"""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    loss_components = {'cls_loss': 0.0, 'reg_loss': 0.0, 'conf_loss': 0.0}
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Validation")
+        for batch in pbar:
+            # Move to device
+            images = batch['images'].to(device)
+            point_clouds = batch['point_clouds'].to(device)
+            annotations = batch['annotations']
+            
+            # Forward pass
+            predictions = model(images, point_clouds)
+            
+            # Compute loss
+            loss, loss_dict = criterion(predictions, point_clouds, annotations)
+            
+            # Accumulate metrics
+            batch_size = len(images)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+            
+            for key in loss_components:
+                if key in loss_dict:
+                    loss_components[key] += loss_dict[key] * batch_size
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'cls': f"{loss_dict.get('cls_loss', 0):.4f}",
+                'reg': f"{loss_dict.get('reg_loss', 0):.4f}",
+                'conf': f"{loss_dict.get('conf_loss', 0):.4f}"
+            })
+    
+    # Average losses
+    avg_loss = total_loss / total_samples
+    for key in loss_components:
+        loss_components[key] /= total_samples
+    
+    return avg_loss, loss_components
+
+
+def plot_training_curves(train_losses, val_losses, save_path):
+    """Plot and save training curves"""
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Total loss
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs, [loss['total_loss'] for loss in train_losses], 'b-', label='Train')
+    plt.plot(epochs, [loss['total_loss'] for loss in val_losses], 'r-', label='Val')
+    plt.title('Total Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Classification loss
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs, [loss['cls_loss'] for loss in train_losses], 'b-', label='Train')
+    plt.plot(epochs, [loss['cls_loss'] for loss in val_losses], 'r-', label='Val')
+    plt.title('Classification Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Regression loss
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs, [loss['reg_loss'] for loss in train_losses], 'b-', label='Train')
+    plt.plot(epochs, [loss['reg_loss'] for loss in val_losses], 'r-', label='Val')
+    plt.title('Regression Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Confidence loss
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs, [loss['conf_loss'] for loss in train_losses], 'b-', label='Train')
+    plt.plot(epochs, [loss['conf_loss'] for loss in val_losses], 'r-', label='Val')
+    plt.title('Confidence Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 
 if __name__ == "__main__":
-    # Configuration
-    config = {
-        'num_classes': 4,
-        'point_feature_dim': 256,
-        'img_feature_dim': 256,
-        'bbox_score_thresh': 0.5,
-        'max_points_per_box': 1000,
-        'min_points_per_box': 10,
-        'matching_distance_threshold': 5.0,  # Distance threshold for GT matching in meters
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-4,
-        'reg_loss_weight': 1.0,
-        'scheduler_step': 10,
-        'scheduler_gamma': 0.5,
-        'epochs': 10,
-        'batch_size': 4,
-        'save_every': 5,
-        'save_dir': 'checkpoints',
-        'use_wandb': False
-    }
-    
-    # Create save directory
-    os.makedirs(config['save_dir'], exist_ok=True)
-    
-    # Initialize wandb if requested
-    if config['use_wandb']:
-        wandb.init(
-            project="pointfusion-training",
-            config=config,
-            name=f"pointfusion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-    
-    # Load dataset
+    # Load environment variables
     load_dotenv()
-    data_path = os.getenv('DATA_PATH', default='src/data/')
-    full_dataset = PointFusionloader(data_path, split='train')
+    dataset_path = os.getenv('DATA_PATH', default='src/data/')
     
-    # Split dataset
-    train_indices, val_indices = train_test_split(
-        range(len(full_dataset)), 
-        test_size=0.2, 
-        random_state=42
-    )
-    train_set = Subset(full_dataset, train_indices)
-    val_set = Subset(full_dataset, val_indices)
-
-    # Create dataloaders
+    # Check if preprocessed data exists
+    train_data_path = os.path.join(dataset_path, 'processed_train_data.pkl')
+    val_data_path = os.path.join(dataset_path, 'processed_val_data.pkl')
+    
+    if os.path.exists(train_data_path) and os.path.exists(val_data_path):
+        print("Loading existing preprocessed data...")
+        train_preprocessor = Preprocessor(load_path=train_data_path)
+        val_preprocessor = Preprocessor(load_path=val_data_path)
+    else:
+        print("Creating new preprocessed data...")
+        # Load and split dataset
+        dataset = PointFusionloader(dataset_path, split='train')
+        train_indices, val_indices = train_test_split(
+            list(range(len(dataset))), test_size=0.2, random_state=42
+        )
+        
+        # Preprocess training data
+        print("Preprocessing training data...")
+        train_preprocessor = Preprocessor()
+        for i in tqdm(train_indices, desc="Processing train samples"):
+            train_preprocessor.process(dataset[i])
+        train_preprocessor.remove_empty_point_clouds()
+        train_preprocessor.save_processed_data(save_path=train_data_path)
+        
+        # Preprocess validation data
+        print("Preprocessing validation data...")
+        val_preprocessor = Preprocessor()
+        for i in tqdm(val_indices, desc="Processing val samples"):
+            val_preprocessor.process(dataset[i])
+        val_preprocessor.remove_empty_point_clouds()
+        val_preprocessor.save_processed_data(save_path=val_data_path)
+    
+    # Create datasets
+    train_dataset = PointFusionDataset(train_preprocessor)
+    val_dataset = PointFusionDataset(val_preprocessor)
+    
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
+    # Create data loaders
     train_loader = DataLoader(
-        train_set, 
-        batch_size=config['batch_size'], 
+        train_dataset, 
+        batch_size=8, 
         shuffle=True, 
-        collate_fn=custom_collate
+        collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        val_set, 
-        batch_size=config['batch_size'], 
+        val_dataset, 
+        batch_size=8, 
         shuffle=False, 
-        collate_fn=custom_collate
+        collate_fn=collate_fn
     )
     
-    print(f"Dataset loaded: {len(train_set)} train, {len(val_set)} val samples")
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Initialize trainer
-    trainer = PointFusionTrainer(config)
+    # Create model
+    model = PointFusion().to(device)
+    print(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
-    # Start training
-    try:
-        train_losses, val_losses, val_maps = trainer.train(train_loader, val_loader)
+    # Create loss function and optimizer
+    criterion = PointFusionLoss(alpha=1.0, beta=10.0, gamma=1.0)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    
+    # Training parameters
+    num_epochs = 20
+    save_dir = os.path.join(dataset_path, '..', 'checkpoints')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+    
+    print(f"\nStarting training for {num_epochs} epochs...")
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print("-" * 50)
+        
+        # Train
+        train_loss, train_components = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_components['total_loss'] = train_loss
+        train_losses.append(train_components)
+        
+        # Validate
+        val_loss, val_components = validate_epoch(model, val_loader, criterion, device)
+        val_components['total_loss'] = val_loss
+        val_losses.append(val_components)
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Print epoch summary
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Train Components: cls={train_components['cls_loss']:.4f}, "
+              f"reg={train_components['reg_loss']:.4f}, conf={train_components['conf_loss']:.4f}")
+        print(f"Val Components: cls={val_components['cls_loss']:.4f}, "
+              f"reg={val_components['reg_loss']:.4f}, conf={val_components['conf_loss']:.4f}")
+        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+        
+        # Save model checkpoints
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'train_loss': train_loss
+            }, os.path.join(save_dir, 'best_model.pth'))
+            print(f"New best model saved! Val loss: {val_loss:.4f}")
+        
+        # Save periodic checkpoint
+        if (epoch + 1) % 5 == 0:
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'train_loss': train_loss
+            }, os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pth'))
         
         # Plot training curves
-        import matplotlib.pyplot as plt
-        
-        plt.figure(figsize=(15, 5))
-        
-        plt.subplot(1, 3, 1)
-        plt.plot(train_losses, label='Train Loss')
-        plt.plot(val_losses, label='Val Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.title('Training and Validation Loss')
-        
-        plt.subplot(1, 3, 2)
-        plt.plot(val_maps, label='Val mAP')
-        plt.xlabel('Epoch')
-        plt.ylabel('mAP')
-        plt.legend()
-        plt.title('Validation mAP')
-        
-        plt.subplot(1, 3, 3)
-        plt.plot([trainer.optimizer.param_groups[0]['lr']] * len(train_losses))
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.title('Learning Rate Schedule')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(config['save_dir'], 'training_curves.png'))
-        plt.show()
-        
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
-    except Exception as e:
-        print(f"Training failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if config['use_wandb']:
-            wandb.finish()
+        if (epoch + 1) % 5 == 0:
+            plot_training_curves(
+                train_losses, 
+                val_losses, 
+                os.path.join(save_dir, 'training_curves.png')
+            )
+    
+    print(f"\nTraining completed! Best validation loss: {best_val_loss:.4f}")
+    print(f"Models saved in: {save_dir}")
+
 
 # python -m src.training.train_PointFusion

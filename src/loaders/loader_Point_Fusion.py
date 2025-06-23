@@ -186,10 +186,15 @@ class PointFusionloader(ArgoDataset):
                 # Convert quaternion to rotation matrix
                 rotation_matrix = self._quaternion_to_rotation_matrix(qw, qx, qy, qz)
                 
-                # Create 4x4 extrinsic matrix (world to camera transformation)
-                extrinsic_matrix = torch.eye(4, dtype=torch.float32)
-                extrinsic_matrix[:3, :3] = rotation_matrix
-                extrinsic_matrix[:3, 3] = torch.tensor([tx, ty, tz], dtype=torch.float32)
+                # Create 4x4 extrinsic matrix (ego-vehicle to camera transformation)
+                # Note: This gives us T_camera_from_ego
+                ego_to_camera_matrix = torch.eye(4, dtype=torch.float32)
+                ego_to_camera_matrix[:3, :3] = rotation_matrix
+                ego_to_camera_matrix[:3, 3] = torch.tensor([tx, ty, tz], dtype=torch.float32)
+                
+                # For point projection, we need camera to ego transformation
+                # T_ego_from_camera = T_camera_from_ego^(-1)
+                extrinsic_matrix = torch.inverse(ego_to_camera_matrix)
                 
             else:
                 extrinsic_matrix = torch.eye(4, dtype=torch.float32)
