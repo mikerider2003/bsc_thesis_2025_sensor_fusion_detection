@@ -43,6 +43,109 @@ class Preprocessor():
             self.annotations = []
             if load_path:
                 print(f"Warning: Could not find file at {load_path}. Initializing empty lists.")
+    
+    def assign_gt(self):
+        """
+        Assign ground truth labels to the cloud of points. Compute center of the cloud of points and match it to the closest center of the ground truth boxes. The update self.annotations to be just {boxes: [x, y, z, l, w, h, heading], labels: [label]}
+        """
+        # Label mapping from string to integer
+        label_to_int = {
+            'PEDESTRIAN': 0,
+            'REGULAR_VEHICLE': 1,
+            'LARGE_VEHICLE': 2,
+            'TRUCK': 3
+        }
+        
+        new_annotations = []
+        
+        for i in tqdm.tqdm(range(len(self.point_clouds)), desc="Assigning ground truth"):
+            point_cloud = self.point_clouds[i]
+            annotation = self.annotations[i]
+            current_label = self.labels[i]
+            
+            # Convert point cloud to numpy if it's a tensor
+            if isinstance(point_cloud, torch.Tensor):
+                points_np = point_cloud.cpu().numpy()
+            else:
+                points_np = point_cloud
+            
+            # Skip empty point clouds
+            if len(points_np) == 0 or np.all(points_np == 0):
+                # Create empty annotation
+                new_annotations.append({
+                    'boxes': torch.empty(0, 7),
+                    'labels': torch.empty(0, dtype=torch.long)
+                })
+                continue
+            
+            # Remove zero-padded points to compute center
+            valid_mask = np.any(points_np != 0, axis=1)
+            valid_points = points_np[valid_mask]
+            
+            if len(valid_points) == 0:
+                # Create empty annotation
+                new_annotations.append({
+                    'boxes': torch.empty(0, 7),
+                    'labels': torch.empty(0, dtype=torch.long)
+                })
+                continue
+            
+            # Compute center of the point cloud
+            point_cloud_center = np.mean(valid_points[:, :3], axis=0)  # [x, y, z]
+            
+            # Extract ground truth boxes from annotation
+            gt_boxes = annotation['boxes']
+            gt_labels = annotation['labels']
+            
+            # Convert to numpy if needed
+            if isinstance(gt_boxes, torch.Tensor):
+                gt_boxes_np = gt_boxes.cpu().numpy()
+            else:
+                gt_boxes_np = gt_boxes
+            
+            if isinstance(gt_labels, torch.Tensor):
+                gt_labels_np = gt_labels.cpu().numpy()
+            else:
+                gt_labels_np = gt_labels
+            
+            if len(gt_boxes_np) == 0:
+                # No ground truth boxes
+                new_annotations.append({
+                    'boxes': torch.empty(0, 7),
+                    'labels': torch.empty(0, dtype=torch.long)
+                })
+                continue
+            
+            # Compute centers of ground truth boxes
+            # Assuming gt_boxes format is [x, y, z, l, w, h, heading]
+            gt_centers = gt_boxes_np[:, :3]  # Extract x, y, z coordinates
+            
+            # Find the closest ground truth box center
+            distances = np.linalg.norm(gt_centers - point_cloud_center, axis=1)
+            closest_idx = np.argmin(distances)
+            
+            # Get the closest box and its label
+            closest_box = gt_boxes_np[closest_idx]
+            closest_label = gt_labels_np[closest_idx]
+            
+            # Convert string label to integer if needed
+            if isinstance(closest_label, str):
+                closest_label_int = label_to_int.get(closest_label, 0)  # Default to 0 if unknown
+            else:
+                closest_label_int = closest_label
+            
+            # Create new annotation with single matched box and label
+            new_annotation = {
+                'boxes': torch.tensor([closest_box], dtype=torch.float32),
+                'labels': torch.tensor([closest_label_int], dtype=torch.long)
+            }
+            
+            new_annotations.append(new_annotation)
+        
+        # Update self.annotations
+        self.annotations = new_annotations
+        
+        print(f"Assigned ground truth to {len(self.annotations)} samples")
 
     def save_processed_data(self, save_path=''):
         """
@@ -895,8 +998,10 @@ if __name__ == "__main__":
 
     for sample in tqdm.tqdm(data):
         processor.process(sample)
+        break # for testing only
 
     processor.remove_empty_point_clouds()
+    processor.assign_gt()
     
     print("Number of rolls:", len(processor.rolls))
     print("Number of point clouds:", len(processor.point_clouds))
@@ -904,7 +1009,7 @@ if __name__ == "__main__":
     print("Number of annotations:", len(processor.annotations))
     
     # Save the processed data
-    saved_path = processor.save_processed_data(os.path.join(dataset_path, 'preprocessed_data.pkl'))
+    # saved_path = processor.save_processed_data(os.path.join(dataset_path, 'preprocessed_data.pkl'))
 
     
 

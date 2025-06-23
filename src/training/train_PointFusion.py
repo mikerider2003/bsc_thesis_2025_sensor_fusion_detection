@@ -117,9 +117,10 @@ class PointFusionLoss(nn.Module):
             valid_matches: [B] tensor indicating which predictions have valid matches
         """
         batch_size = len(pred_centers)
-        matched_gt_boxes = torch.zeros(batch_size, 7, device=pred_centers.device)
-        matched_gt_labels = torch.zeros(batch_size, dtype=torch.long, device=pred_centers.device)
-        valid_matches = torch.zeros(batch_size, dtype=torch.bool, device=pred_centers.device)
+        device = pred_centers.device
+        matched_gt_boxes = torch.zeros(batch_size, 7, device=device)
+        matched_gt_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+        valid_matches = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
         label_to_idx = {
             'PEDESTRIAN': 0,
@@ -133,12 +134,17 @@ class PointFusionLoss(nn.Module):
             annotation = annotations[b]
             
             if annotation['boxes'].shape[0] == 0:
-                # No ground truth boxes for this sample
-                raise ValueError(f"No ground truth boxes for batch index {b}")
+                # No ground truth boxes for this sample - skip this sample
                 continue
                 
             gt_boxes = annotation['boxes']  # [N_gt, 7] 
             gt_labels = annotation['labels']  # [N_gt]
+            
+            # Move gt_boxes to the same device as predictions
+            if isinstance(gt_boxes, torch.Tensor):
+                gt_boxes = gt_boxes.to(device)
+            else:
+                gt_boxes = torch.tensor(gt_boxes, device=device, dtype=torch.float32)
             
             # Compute distances from predicted center to all GT box centers
             gt_centers = gt_boxes[:, :3]  # [N_gt, 3] - x,y,z coordinates
@@ -151,8 +157,17 @@ class PointFusionLoss(nn.Module):
             matched_gt_boxes[b] = gt_boxes[closest_idx]
             
             # Convert string label to index
-            gt_label_str = gt_labels[closest_idx]
-            matched_gt_labels[b] = label_to_idx.get(gt_label_str, 0)
+            if isinstance(gt_labels, torch.Tensor):
+                gt_label_str = gt_labels[closest_idx].item() if gt_labels[closest_idx].dim() == 0 else gt_labels[closest_idx]
+            else:
+                gt_label_str = gt_labels[closest_idx]
+            
+            # Handle both string and numeric labels
+            if isinstance(gt_label_str, str):
+                matched_gt_labels[b] = label_to_idx.get(gt_label_str, 0)
+            else:
+                matched_gt_labels[b] = int(gt_label_str) if gt_label_str in [0, 1, 2, 3] else 0
+                
             valid_matches[b] = True
             
         return matched_gt_boxes, matched_gt_labels, valid_matches
@@ -390,11 +405,20 @@ if __name__ == "__main__":
     # Check if preprocessed data exists
     train_data_path = os.path.join(dataset_path, 'processed_train_data.pkl')
     val_data_path = os.path.join(dataset_path, 'processed_val_data.pkl')
-    
-    if os.path.exists(train_data_path) and os.path.exists(val_data_path):
+    train_data_path_improved = os.path.join(dataset_path, 'processed_train_data_improved.pkl')
+    val_data_path_improved = os.path.join(dataset_path, 'processed_val_data_improved.pkl')
+
+
+    if os.path.exists(train_data_path_improved) and os.path.exists(val_data_path_improved):
+        print("Loading existing preprocessed data...")
+        train_preprocessor = Preprocessor(load_path=train_data_path_improved)
+        val_preprocessor = Preprocessor(load_path=val_data_path_improved)
+    elif os.path.exists(train_data_path) and os.path.exists(val_data_path):
         print("Loading existing preprocessed data...")
         train_preprocessor = Preprocessor(load_path=train_data_path)
         val_preprocessor = Preprocessor(load_path=val_data_path)
+        train_preprocessor.assign_gt()
+        val_preprocessor.assign_gt()
     else:
         print("Creating new preprocessed data...")
         # Load and split dataset
@@ -455,7 +479,7 @@ if __name__ == "__main__":
     
     # Training parameters
     num_epochs = 20
-    save_dir = os.path.join(dataset_path, '..', 'checkpoints')
+    save_dir = 'checkpoints'
     os.makedirs(save_dir, exist_ok=True)
     
     # Training loop
