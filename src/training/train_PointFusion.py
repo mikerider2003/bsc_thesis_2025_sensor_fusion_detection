@@ -70,7 +70,7 @@ class PointFusionDataset(Dataset):
 class PointFusionLoss(nn.Module):
     """
     Loss function for PointFusion model. 
-    Matches center of point_clouds to closest annotations['boxes'] then computes classification and regression loss.
+    Since GT assignment is now done during preprocessing, each sample has exactly one matched GT box and label.
     """
     def __init__(self, alpha=1.0, beta=10.0, gamma=1.0):
         super().__init__()
@@ -83,102 +83,13 @@ class PointFusionLoss(nn.Module):
         self.regression_loss = nn.SmoothL1Loss()
         self.confidence_loss = nn.BCELoss()
         
-    def compute_point_cloud_center(self, point_clouds):
-        """
-        Compute center of point clouds
-        Args:
-            point_clouds: [B, N, 3] tensor of point clouds
-        Returns:
-            centers: [B, 3] tensor of centers
-        """
-        centers = []
-        for pc in point_clouds:
-            # Remove zero-padded points
-            valid_mask = torch.any(pc != 0, dim=1)
-            valid_points = pc[valid_mask]
-            
-            if len(valid_points) > 0:
-                center = torch.mean(valid_points, dim=0)  # [3]
-            else:
-                center = torch.zeros(3, device=pc.device)
-            centers.append(center)
-        
-        return torch.stack(centers)  # [B, 3]
-    
-    def match_predictions_to_gt(self, pred_centers, annotations):
-        """
-        Match predicted centers to closest ground truth boxes
-        Args:
-            pred_centers: [B, 3] tensor of predicted centers
-            annotations: list of annotation dicts for each batch item
-        Returns:
-            matched_gt_boxes: [B, 7] tensor of matched GT boxes (x,y,z,l,w,h,heading)
-            matched_gt_labels: [B] tensor of matched GT labels  
-            valid_matches: [B] tensor indicating which predictions have valid matches
-        """
-        batch_size = len(pred_centers)
-        device = pred_centers.device
-        matched_gt_boxes = torch.zeros(batch_size, 7, device=device)
-        matched_gt_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
-        valid_matches = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
-        label_to_idx = {
-            'PEDESTRIAN': 0,
-            'REGULAR_VEHICLE': 1, 
-            'LARGE_VEHICLE': 2,
-            'TRUCK': 3
-        }
-        
-        for b in range(batch_size):
-            pred_center = pred_centers[b]  # [3]
-            annotation = annotations[b]
-            
-            if annotation['boxes'].shape[0] == 0:
-                # No ground truth boxes for this sample - skip this sample
-                continue
-                
-            gt_boxes = annotation['boxes']  # [N_gt, 7] 
-            gt_labels = annotation['labels']  # [N_gt]
-            
-            # Move gt_boxes to the same device as predictions
-            if isinstance(gt_boxes, torch.Tensor):
-                gt_boxes = gt_boxes.to(device)
-            else:
-                gt_boxes = torch.tensor(gt_boxes, device=device, dtype=torch.float32)
-            
-            # Compute distances from predicted center to all GT box centers
-            gt_centers = gt_boxes[:, :3]  # [N_gt, 3] - x,y,z coordinates
-            distances = torch.norm(pred_center.unsqueeze(0) - gt_centers, dim=1)  # [N_gt]
-            
-            # Find closest GT box
-            closest_idx = torch.argmin(distances)
-            
-            # Set matched values
-            matched_gt_boxes[b] = gt_boxes[closest_idx]
-            
-            # Convert string label to index
-            if isinstance(gt_labels, torch.Tensor):
-                gt_label_str = gt_labels[closest_idx].item() if gt_labels[closest_idx].dim() == 0 else gt_labels[closest_idx]
-            else:
-                gt_label_str = gt_labels[closest_idx]
-            
-            # Handle both string and numeric labels
-            if isinstance(gt_label_str, str):
-                matched_gt_labels[b] = label_to_idx.get(gt_label_str, 0)
-            else:
-                matched_gt_labels[b] = int(gt_label_str) if gt_label_str in [0, 1, 2, 3] else 0
-                
-            valid_matches[b] = True
-            
-        return matched_gt_boxes, matched_gt_labels, valid_matches
-    
-    def forward(self, predictions, point_clouds, annotations):
+    def forward(self, predictions, labels, annotations):
         """
         Compute loss for PointFusion predictions
         Args:
             predictions: dict with 'cls_scores', 'bbox_pred', 'confidence'
-            point_clouds: [B, N, 3] tensor of point clouds
-            annotations: list of annotation dicts
+            labels: [B] tensor of ground truth class labels (already matched during preprocessing)
+            annotations: list of annotation dicts (each contains single matched box and label)
         Returns:
             total_loss: scalar loss value
             loss_dict: dict with individual loss components
@@ -188,36 +99,49 @@ class PointFusionLoss(nn.Module):
         bbox_pred = predictions['bbox_pred']    # [B, 7]
         confidence = predictions['confidence']  # [B, 1]
         
-        # Compute point cloud centers
-        pred_centers = self.compute_point_cloud_center(point_clouds)
+        batch_size = cls_scores.shape[0]
+        device = cls_scores.device
         
-        # Match predictions to ground truth
-        matched_gt_boxes, matched_gt_labels, valid_matches = self.match_predictions_to_gt(
-            pred_centers, annotations
-        )
+        # Extract ground truth boxes from annotations (already matched during preprocessing)
+        gt_boxes = []
+        valid_samples = []
         
-        # Only compute loss for valid matches
-        if not valid_matches.any():
-            # No valid matches - return zero loss
-            total_loss = torch.tensor(0.0, device=cls_scores.device, requires_grad=True)
+        for i, annotation in enumerate(annotations):
+            if annotation['boxes'].shape[0] > 0:
+                # Each annotation should have exactly one box after preprocessing
+                gt_box = annotation['boxes'][0]  # [7] - single matched box
+                if isinstance(gt_box, torch.Tensor):
+                    gt_boxes.append(gt_box.to(device))
+                else:
+                    gt_boxes.append(torch.tensor(gt_box, device=device, dtype=torch.float32))
+                valid_samples.append(i)
+            else:
+                # Skip samples with no valid ground truth
+                continue
+        
+        if len(valid_samples) == 0:
+            # No valid samples - return zero loss
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
             return total_loss, {'cls_loss': 0.0, 'reg_loss': 0.0, 'conf_loss': 0.0}
         
-        # Filter to only valid matches
-        valid_cls_scores = cls_scores[valid_matches]
-        valid_bbox_pred = bbox_pred[valid_matches]
-        valid_confidence = confidence[valid_matches]
-        valid_gt_boxes = matched_gt_boxes[valid_matches]
-        valid_gt_labels = matched_gt_labels[valid_matches]
+        # Convert to tensors and filter valid samples
+        valid_indices = torch.tensor(valid_samples, device=device)
+        gt_boxes_tensor = torch.stack(gt_boxes)  # [N_valid, 7]
+        
+        # Filter predictions and labels to only valid samples
+        valid_cls_scores = cls_scores[valid_indices]  # [N_valid, num_classes]
+        valid_bbox_pred = bbox_pred[valid_indices]    # [N_valid, 7]
+        valid_confidence = confidence[valid_indices]  # [N_valid, 1]
+        valid_labels = labels[valid_indices]          # [N_valid]
         
         # Classification loss
-        cls_loss = self.classification_loss(valid_cls_scores, valid_gt_labels)
+        cls_loss = self.classification_loss(valid_cls_scores, valid_labels)
         
         # Regression loss (for box parameters)
-        reg_loss = self.regression_loss(valid_bbox_pred, valid_gt_boxes)
+        reg_loss = self.regression_loss(valid_bbox_pred, gt_boxes_tensor)
         
-        # Confidence loss (high confidence for good matches)
-        # Use IoU or distance-based confidence targets
-        target_confidence = torch.ones_like(valid_confidence)  # High confidence for matched predictions
+        # Confidence loss (high confidence for all valid samples since GT is already matched)
+        target_confidence = torch.ones_like(valid_confidence)  # High confidence for all matched predictions
         conf_loss = self.confidence_loss(valid_confidence, target_confidence)
         
         # Combine losses
@@ -262,14 +186,15 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         # Move to device
         images = batch['images'].to(device)
         point_clouds = batch['point_clouds'].to(device)
+        labels = batch['labels'].to(device)
         annotations = batch['annotations']
         
         # Forward pass
         optimizer.zero_grad()
         predictions = model(images, point_clouds)
         
-        # Compute loss
-        loss, loss_dict = criterion(predictions, point_clouds, annotations)
+        # Compute loss (now passing labels directly since GT is assigned during preprocessing)
+        loss, loss_dict = criterion(predictions, labels, annotations)
         
         # Backward pass
         loss.backward()
@@ -313,13 +238,14 @@ def validate_epoch(model, dataloader, criterion, device):
             # Move to device
             images = batch['images'].to(device)
             point_clouds = batch['point_clouds'].to(device)
+            labels = batch['labels'].to(device)
             annotations = batch['annotations']
             
             # Forward pass
             predictions = model(images, point_clouds)
             
-            # Compute loss
-            loss, loss_dict = criterion(predictions, point_clouds, annotations)
+            # Compute loss (now passing labels directly since GT is assigned during preprocessing)
+            loss, loss_dict = criterion(predictions, labels, annotations)
             
             # Accumulate metrics
             batch_size = len(images)
